@@ -30,4 +30,5 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/emhass:latest
+          tags: ghcr.io/joshc1994/emhass:latest
+
