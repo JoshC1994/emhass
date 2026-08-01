@@ -152,6 +152,18 @@ def get_forecast_dates(
     return [ts.isoformat() for ts in forecast_dates]
 
 
+def build_irregular_index(timestamps: list[str], time_zone: str) -> pd.DatetimeIndex:
+    """
+    Build a timezone-aware DatetimeIndex from ISO8601 timestamp strings.
+
+    This is used when variable_timestep is enabled and runtime forecast data
+    is provided as a dictionary keyed by real timestamps instead of being resampled
+    onto the uniform optimization_time_step grid.
+    """
+    idx = pd.to_datetime(timestamps, format="ISO8601", utc=True)
+    return pd.DatetimeIndex(idx).tz_convert(time_zone)
+
+
 def normalize_heat_cool_mode(
     value: str,
     *,
@@ -1862,76 +1874,126 @@ async def treat_runtimeparams(
 
         # Loop forecasts, check if value is a list and greater than or equal to forecast_dates
         for method, forecast_key in enumerate(list_forecast_key):
-            if forecast_key in runtimeparams.keys():
+            if forecast_key in runtimeparams:
                 forecast_input = runtimeparams[forecast_key]
+                variable_timestep = params["retrieve_hass_conf"].get(
+                    "variable_timestep", False
+                )
+
+                # Check if string contains list, if so extract
+                if isinstance(forecast_input, str):
+                    try:
+                        parsed_forecast_input = ast.literal_eval(forecast_input)
+                    except (ValueError, SyntaxError):
+                        parsed_forecast_input = forecast_input
+                    if isinstance(parsed_forecast_input, list):
+                        forecast_input = parsed_forecast_input
+                        runtimeparams[forecast_key] = forecast_input
+
+                forecast_input_has_timestamps = isinstance(forecast_input, dict)
+
                 if isinstance(forecast_input, dict):
-                    forecast_data_df = pd.DataFrame.from_dict(
-                        forecast_input, orient="index"
-                    ).reset_index()
-                    forecast_data_df.columns = ["time", "value"]
+                    forecast_data_df = (
+                        pd.DataFrame.from_dict(forecast_input, orient="index")
+                        .reset_index()
+                        .rename(columns={"index": "time", 0: "value"})
+                    )
                     forecast_data_df["time"] = pd.to_datetime(
                         forecast_data_df["time"], format="ISO8601", utc=True
                     ).dt.tz_convert(time_zone)
+                    forecast_data_df = forecast_data_df.sort_values("time")
 
-                    # Aggregate any sub-step points to the optimization time step.
-                    # Resample in the local time_zone so the buckets line up with the
-                    # forecast grid, which get_forecast_dates floors in local time
-                    # (this matters for sub-hour UTC offsets such as +05:30).
+                    if variable_timestep:
+                        captured_ts = [
+                            ts.isoformat() for ts in forecast_data_df["time"]
+                        ]
+                        # Consistency check: all variable-step forecasts must share the same grid
+                        ref_ts_key = f"{list_forecast_key[0]}_timestamps"
+                        if ref_ts_key in params["passed_data"] and forecast_key != list_forecast_key[0]:
+                            if params["passed_data"][ref_ts_key] != captured_ts:
+                                logger.warning(
+                                    f"variable_timestep: timestamp grid of '{forecast_key}' "
+                                    f"differs from '{list_forecast_key[0]}'; "
+                                    "results may be misaligned."
+                                )
+                        params["passed_data"][forecast_key] = forecast_data_df["value"].tolist()
+                        params["passed_data"][f"{forecast_key}_timestamps"] = captured_ts
+                        params["optim_conf"][forecast_methods[method]] = "list"
+                        continue
+
+                    # Fixed-step path: preserve existing behaviour
                     forecast_data_df = forecast_data_df.resample(
                         pd.to_timedelta(optimization_time_step, "minutes"),
                         on="time",
                     ).aggregate({"value": "mean"})
-                    # Now move to UTC so the union/reindex below align by instant
-                    # across DST edges without mixing two differently-localized
-                    # indexes. forecast_dates is a list of ISO strings; parse it to
-                    # the same UTC index. tz_convert only relabels, the instants are
-                    # unchanged, so the local-time aggregation above is preserved.
                     forecast_data_df.index = forecast_data_df.index.tz_convert("UTC")
                     target_dates = pd.to_datetime(forecast_dates, utc=True)
-                    # Align with forecast_dates using hold-last (step) semantics: each
-                    # value holds until the next provided point. Union the provided
-                    # index with the horizon first so points defined before
-                    # forecast_dates[0] still anchor the forward-fill; reindexing
-                    # straight onto forecast_dates with method="nearest" dropped that
-                    # anchor and let the trailing bfill fill the leading slots with the
-                    # NEXT value instead (issue #1003).
                     combined_index = forecast_data_df.index.union(target_dates)
                     forecast_data_df = forecast_data_df.reindex(combined_index)
-                    # ffill applies the hold-last; bfill then covers any slots before
-                    # the first provided point (a dict that starts after the window
-                    # start) by extending that first value back over them.
-                    forecast_data_df["value"] = forecast_data_df["value"].ffill().bfill()
+                    forecast_data_df["value"] = (
+                        forecast_data_df["value"].ffill().bfill()
+                    )
                     forecast_data_df = forecast_data_df.reindex(target_dates)
                     forecast_input = forecast_data_df["value"].tolist()
-                if isinstance(forecast_input, list) and len(forecast_input) >= len(forecast_dates):
+
+                if (
+                    isinstance(forecast_input, list)
+                    and len(forecast_input) >= len(forecast_dates)
+                ):
+                    if (
+                        params["retrieve_hass_conf"].get("variable_timestep", False)
+                        and not forecast_input_has_timestamps
+                    ):
+                        logger.warning(
+                            f"variable_timestep is enabled but '{forecast_key}' was passed "
+                            "as a plain list (no timestamps). Falling back to fixed-step "
+                            "alignment for this forecast; irregular grid will not apply."
+                        )
                     params["passed_data"][forecast_key] = forecast_input
                     params["optim_conf"][forecast_methods[method]] = "list"
                 else:
                     logger.error(
                         f"ERROR: The passed data is either the wrong type or the length is not correct, length should be {str(len(forecast_dates))}"
                     )
+                    bad_value = runtimeparams[forecast_key]
+                    bad_len = len(bad_value) if hasattr(bad_value, "__len__") else "N/A"
                     logger.error(
-                        f"Passed type is {str(type(runtimeparams[forecast_key]))} and length is {str(len(runtimeparams[forecast_key]))}"
+                        f"Passed type is {str(type(bad_value))} and length is {str(bad_len)}"
                     )
-                # Check if string contains list, if so extract
-                if isinstance(forecast_input, str) and isinstance(
-                    ast.literal_eval(forecast_input), list
-                ):
-                    forecast_input = ast.literal_eval(forecast_input)
-                    runtimeparams[forecast_key] = forecast_input
-                list_non_digits = [
-                    x for x in forecast_input if not (isinstance(x, int) or isinstance(x, float))
-                ]
-                if len(list_non_digits) > 0:
-                    logger.warning(
-                        f"There are non numeric values on the passed data for {forecast_key}, check for missing values (nans, null, etc)"
-                    )
-                    for x in list_non_digits:
+
+                if isinstance(forecast_input, list):
+                    list_non_digits = [
+                        x
+                        for x in forecast_input
+                        if not (isinstance(x, int) or isinstance(x, float))
+                    ]
+                    if len(list_non_digits) > 0:
                         logger.warning(
-                            f"This value in {forecast_key} was detected as non digits: {str(x)}"
+                            f"There are non numeric values on the passed data for {forecast_key}, check for missing values (nans, null, etc)"
                         )
+                        for x in list_non_digits:
+                            logger.warning(
+                                f"This value in {forecast_key} was detected as non digits: {str(x)}"
+                            )
             else:
                 params["passed_data"][forecast_key] = None
+
+        # When variable_timestep is on, override forecast_dates with the actual
+        # timestamp grid captured from the runtime forecast dicts above.
+        # Priority: load_cost_forecast > pv_power_forecast > load_power_forecast
+        if params["retrieve_hass_conf"].get("variable_timestep", False):
+            _ts_anchor = None
+            for _anchor_key in ("load_cost_forecast", "pv_power_forecast", "load_power_forecast"):
+                _ts_key = f"{_anchor_key}_timestamps"
+                if _ts_key in params["passed_data"]:
+                    _ts_anchor = params["passed_data"][_ts_key]
+                    break
+            if _ts_anchor is not None:
+                forecast_dates = _ts_anchor
+                logger.debug(
+                    f"variable_timestep: forecast_dates overridden with "
+                    f"{len(forecast_dates)}-step irregular grid from runtime input."
+                )
 
         # Explicitly handle historic_days_to_retrieve from runtimeparams BEFORE validation
         if "historic_days_to_retrieve" in runtimeparams:

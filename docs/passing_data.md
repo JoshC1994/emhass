@@ -57,7 +57,13 @@ The possible dictionary keys to pass data are:
 
 #### Passing a forecast as timestamped values
 
-Instead of a plain list, any of these forecast keys can be passed as an object that maps ISO 8601 timestamps to values. EMHASS aggregates the points to the optimization time step and then holds each value until the next provided point (step interpolation), so you only need to supply a point where the value changes. A point whose timestamp falls before the start of the optimization window is used to anchor the first values of the horizon.
+Instead of a plain list, any of these forecast keys can be passed as an object that maps ISO 8601 timestamps to values.
+
+With the default configuration (`variable_timestep: false`), EMHASS preserves the existing behaviour: the timestamped points are aggregated to the configured `optimization_time_step` grid and then aligned to the optimization horizon.
+
+When `variable_timestep: true`, EMHASS preserves the actual timestamps from the runtime forecast dictionary and carries them forward for downstream processing as an irregular forecast horizon. This is intended for forecast sources that provide mixed or non-uniform resolutions, for example short near-term intervals and longer later intervals.
+
+If `variable_timestep` is enabled but a plain list is passed instead of timestamped values, EMHASS falls back to the normal fixed-step handling for that forecast.
 
 ```json
 {
