@@ -1,0 +1,128 @@
+name: Build and dispatch branch image to add-on repo
+
+# Fires on every push to any branch, and whenever a branch is deleted.
+# - On push: builds a multi-arch image for this branch and tells the
+#   emhass-add-on repo to create/update a matching add-on folder.
+# - On delete: tells the emhass-add-on repo to remove that branch's
+#   add-on folder so it disappears from the Home Assistant store.
+
+on:
+  push:
+    branches:
+      - '**'
+  delete:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: emhass
+  ADDON_REPO: JoshC1994/emhass-add-on
+
+jobs:
+  compute-slug:
+    if: github.event_name == 'push' || github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.vars.outputs.branch }}
+      slug: ${{ steps.vars.outputs.slug }}
+      is_master: ${{ steps.vars.outputs.is_master }}
+    steps:
+      - name: Compute branch name and slug
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "delete" ]; then
+            RAW_BRANCH="${{ github.event.ref }}"
+          else
+            RAW_BRANCH="${{ github.ref_name }}"
+          fi
+
+          SLUG=$(echo "$RAW_BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g')
+
+          IS_MASTER="false"
+          if [ "$RAW_BRANCH" = "master" ] || [ "$RAW_BRANCH" = "main" ]; then
+            IS_MASTER="true"
+          fi
+
+          echo "branch=$RAW_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "is_master=$IS_MASTER" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: compute-slug
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Define image tags
+        id: tags
+        run: |
+          SLUG="${{ needs.compute-slug.outputs.slug }}"
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${OWNER_LC}/${{ env.IMAGE_NAME }}-${SLUG}"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "run_tag=${BASE}:${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${BASE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image (amd64 + aarch64 + armv7)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.run_tag }}
+            ${{ steps.tags.outputs.latest_tag }}
+          build-args: |
+            BUILD_VERSION=${{ github.run_number }}
+            BUILD_FROM=ghcr.io/hassio-addons/base/amd64:15.0.7
+
+      - name: Dispatch update to add-on repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ADDON_REPO_TOKEN }}
+          repository: ${{ env.ADDON_REPO }}
+          event-type: emhass-branch-updated
+          client-payload: |-
+            {
+              "branch": "${{ needs.compute-slug.outputs.branch }}",
+              "slug": "${{ needs.compute-slug.outputs.slug }}",
+              "is_master": ${{ needs.compute-slug.outputs.is_master }},
+              "run_number": "${{ github.run_number }}",
+              "sha": "${{ github.sha }}",
+              "image_base": "${{ steps.tags.outputs.base }}"
+            }
+
+  notify-branch-deleted:
+    needs: compute-slug
+    if: github.event_name == 'delete' && github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch branch-deleted event to add-on repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ADDON_REPO_TOKEN }}
+          repository: ${{ env.ADDON_REPO }}
+          event-type: emhass-branch-deleted
+          client-payload: |-
+            {
+              "branch": "${{ needs.compute-slug.outputs.branch }}",
+              "slug": "${{ needs.compute-slug.outputs.slug }}"
+            }
