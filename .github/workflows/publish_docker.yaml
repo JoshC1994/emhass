@@ -13,33 +13,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  get-branch-info:
-    runs-on: ubuntu-latest
-    outputs:
-      branch_name: ${{ steps.get-branch.outputs.branch }}
-      base_version: ${{ steps.get-version.outputs.base_version }}
-      short_sha: ${{ steps.get-branch.outputs.short_sha }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Get branch name
-        id: get-branch
-        run: |
-          BRANCH="${{ github.ref_name }}"
-          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
-          echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
-
-      - name: Get base version from pyproject.toml
-        id: get-version
-        run: |
-          VERSION=$(grep -m1 '^version\s*=' pyproject.toml | cut -d'"' -f2)
-          echo "base_version=$VERSION" >> $GITHUB_OUTPUT
-
   build-and-push:
-    needs: get-branch-info
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -48,6 +22,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get branch info
+        id: branch-info
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          echo "branch_name=$BRANCH" >> $GITHUB_OUTPUT
+          echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          VERSION=$(grep -m1 '^version\s*=' pyproject.toml | cut -d'"' -f2)
+          echo "base_version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -68,8 +53,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ needs.get-branch-info.outputs.base_version }}-${{ needs.get-branch-info.outputs.short_sha }}-${{ needs.get-branch-info.outputs.branch_name }}
-            type=raw,value=${{ needs.get-branch-info.outputs.branch_name }}
+            type=raw,value=${{ steps.branch-info.outputs.base_version }}-${{ steps.branch-info.outputs.short_sha }}-${{ steps.branch-info.outputs.branch_name }}
+            type=raw,value=${{ steps.branch-info.outputs.branch_name }}
             type=semver,pattern={{version}}
 
       - name: Build and push Docker image
