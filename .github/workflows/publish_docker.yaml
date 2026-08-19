@@ -1,74 +1,73 @@
-name: Publish Docker
+name: Publish Docker and Sync Add-on
 
 on:
   push:
     branches:
-      - '**'
+      - "**"
+
   workflow_dispatch:
-    inputs:
-      target_branch:
-        description: 'Branch to build'
-        required: false
-        default: ''
+
+permissions:
+  contents: read
+  packages: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/joshc1994/emhass
 
 jobs:
-  build-and-push:
+  build-and-sync:
+    name: Build image and update HA add-on
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
 
     steps:
-      - name: Check out repository
+      - name: Check out EMHASS
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.target_branch || github.ref }}
           fetch-depth: 1
 
-      - name: Calculate image information
-        id: image-info
+      - name: Calculate build metadata
+        id: metadata
         shell: bash
         run: |
           set -euo pipefail
 
-          BRANCH="${{ github.event.inputs.target_branch || github.ref_name }}"
-          SHA="${GITHUB_SHA:0:7}"
+          branch="${GITHUB_REF_NAME}"
+          short_sha="$(git rev-parse --short=7 HEAD)"
 
-          SAFE_BRANCH="$(printf '%s' "$BRANCH" \
+          safe_branch="$(printf '%s' "$branch" \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's#[^a-z0-9._-]#-#g' \
             | sed 's/^-*//' \
             | sed 's/-*$//')"
 
-          if [ -z "$SAFE_BRANCH" ]; then
-            SAFE_BRANCH="unknown"
+          if [ -z "$safe_branch" ]; then
+            echo "Could not create a Docker-safe branch name."
+            exit 1
           fi
 
-          # Extract version from pyproject.toml
-          VERSION=$(grep -E '^version\s*=' pyproject.toml | head -1 | cut -d'"' -f2 || echo "0.0.0")
-          
-          if [ -z "$VERSION" ]; then
-            VERSION="0.0.0"
+          base_version="$(
+            grep -E '^[[:space:]]*version[[:space:]]*=' pyproject.toml \
+              | head -n 1 \
+              | sed -E 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*["'\'']([^"'\'']+)["'\''].*/\1/'
+          )"
+
+          if [ -z "$base_version" ]; then
+            base_version="0.0.0"
           fi
 
-          IMAGE_TAG="${VERSION}-${SHA}-${SAFE_BRANCH}"
+          image_tag="${base_version}-${short_sha}-${safe_branch}"
 
-          echo "branch=$BRANCH"
-          echo "safe_branch=$SAFE_BRANCH"
-          echo "version=$VERSION"
-          echo "sha=$SHA"
-          echo "image_tag=$IMAGE_TAG"
+          echo "Branch: $branch"
+          echo "Version: $base_version"
+          echo "Image tag: $image_tag"
 
           {
-            echo "branch=$BRANCH"
-            echo "safe_branch=$SAFE_BRANCH"
-            echo "version=$VERSION"
-            echo "sha=$SHA"
-            echo "image_tag=$IMAGE_TAG"
+            echo "branch=$branch"
+            echo "short_sha=$short_sha"
+            echo "base_version=$base_version"
+            echo "safe_branch=$safe_branch"
+            echo "image_tag=$image_tag"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
@@ -84,7 +83,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -92,16 +91,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.image-info.outputs.image_tag }}
-            ${{ env.IMAGE_NAME }}:${{ steps.image-info.outputs.safe_branch }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.image-info.outputs.image_tag }}
-          cache-from: type=gha,scope=${{ steps.image-info.outputs.safe_branch }}
-          cache-to: type=gha,mode=max,scope=${{ steps.image-info.outputs.safe_branch }}
+            ${{ env.IMAGE_NAME }}:${{ steps.metadata.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:${{ steps.metadata.outputs.safe_branch }}
+          cache-from: type=gha,scope=${{ steps.metadata.outputs.safe_branch }}
+          cache-to: type=gha,mode=max,scope=${{ steps.metadata.outputs.safe_branch }}
 
-      - name: Dispatch build information to add-on repository
+      - name: Trigger add-on repository sync
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.ADDON_SYNC_TOKEN }}
@@ -109,9 +104,8 @@ jobs:
           event-type: emhass-branch-sync
           client-payload: >-
             {
-              "branch_name": "${{ steps.image-info.outputs.branch }}",
+              "branch_name": "${{ steps.metadata.outputs.branch }}",
               "commit_sha": "${{ github.sha }}",
-              "short_sha": "${{ steps.image-info.outputs.sha }}",
-              "base_version": "${{ steps.image-info.outputs.version }}",
-              "image": "${{ env.IMAGE_NAME }}:${{ steps.image-info.outputs.image_tag }}"
+              "short_sha": "${{ steps.metadata.outputs.short_sha }}",
+              "base_version": "${{ steps.metadata.outputs.base_version }}"
             }
