@@ -1,104 +1,65 @@
-name: Sync to Addon on Commit
+name: Trigger Addon Sync
 
 on:
   push:
     branches:
-      - master
-    paths-ignore:
-      - '.github/workflows/trigger_addon_sync.yaml'
+      - '*'
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Branch to sync'
+        required: false
+        default: ''
 
 jobs:
-  sync-to-addon:
+  get-branch-info:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
+    outputs:
+      branch_name: ${{ steps.get-branch.outputs.branch }}
+      commit_sha: ${{ steps.get-branch.outputs.sha }}
+      short_sha: ${{ steps.get-branch.outputs.short_sha }}
+      base_version: ${{ steps.get-version.outputs.base_version }}
     steps:
-      - name: Checkout emhass
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          path: emhass
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
 
-      - name: Checkout emhass-add-on
-        uses: actions/checkout@v4
+      - name: Get branch name
+        id: get-branch
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ github.event.inputs.target_branch }}"
+            if [ -z "$BRANCH" ]; then
+              BRANCH="${{ github.ref_name }}"
+            fi
+          else
+            BRANCH="${{ github.ref_name }}"
+          fi
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Get base version from pyproject.toml
+        id: get-version
+        run: |
+          VERSION=$(grep -m1 '^version\s*=' pyproject.toml | cut -d'"' -f2)
+          echo "base_version=$VERSION" >> $GITHUB_OUTPUT
+
+  dispatch-to-addon-repo:
+    needs: get-branch-info
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository Dispatch
+        uses: peter-evans/repository-dispatch@v3
         with:
+          token: ${{ secrets.ADDON_SYNC_TOKEN }}
           repository: JoshC1994/emhass-add-on
-          path: emhass-add-on
-          token: ${{ secrets.ADDON_PAT }}
-
-      - name: Sync emhass into addon
-        run: |
-          cd emhass-add-on
-          
-          # Remove old emhass code (but keep addon config)
-          rm -rf emhass/CHANGELOG.md emhass/DOCS.md emhass/README.md emhass/Test.md emhass/config.yml emhass/icon.png emhass/logo.png emhass/images emhass/translations
-          
-          # Copy new emhass code
-          cp -r ../emhass/. emhass/
-          
-          echo "Synced emhass into addon"
-
-      - name: Get version from emhass
-        id: version
-        run: |
-          cd emhass
-          BASE_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2 || echo "0.18.1")
-          echo "BASE_VERSION=$BASE_VERSION" >> $GITHUB_OUTPUT
-          
-          EMHASS_SHA=$(git rev-parse --short=7 HEAD)
-          echo "EMHASS_SHA=$EMHASS_SHA" >> $GITHUB_OUTPUT
-
-      - name: Get addon commit SHA
-        id: addon_commit
-        run: |
-          cd emhass-add-on
-          ADDON_SHA=$(git rev-parse --short=7 HEAD)
-          echo "ADDON_SHA=$ADDON_SHA" >> $GITHUB_OUTPUT
-
-      - name: Update addon config.yml
-        run: |
-          cd emhass-add-on
-          
-          BASE_VERSION="${{ steps.version.outputs.BASE_VERSION }}"
-          ADDON_SHA="${{ steps.addon_commit.outputs.ADDON_SHA }}"
-          FULL_VERSION="v${BASE_VERSION}-${ADDON_SHA}"
-          
-          # Update version
-          sed -i "s/^version: .*/version: \"$FULL_VERSION\"/" emhass/config.yml
-          
-          # Update name
-          sed -i "s/^name: .*/name: \"EMHASS - master\"/" emhass/config.yml
-          
-          echo "Updated to $FULL_VERSION"
-
-      - name: Commit and push to addon
-        run: |
-          cd emhass-add-on
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git add -A
-          if git diff --staged --quiet; then
-            echo "No changes"
-          else
-            BASE_VERSION="${{ steps.version.outputs.BASE_VERSION }}"
-            git commit -m "Auto-sync from emhass v${BASE_VERSION}"
-            git push origin main
-          fi
-
-      - name: Create Git tag
-        run: |
-          cd emhass-add-on
-          BASE_VERSION="${{ steps.version.outputs.BASE_VERSION }}"
-          ADDON_SHA="${{ steps.addon_commit.outputs.ADDON_SHA }}"
-          TAG_NAME="v${BASE_VERSION}-${ADDON_SHA}"
-          
-          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
-            echo "Tag exists"
-          else
-            git config user.name "GitHub Actions"
-            git config user.email "actions@github.com"
-            git tag -a "$TAG_NAME" -m "Auto-release $TAG_NAME"
-            git push origin "$TAG_NAME"
-            echo "Created tag: $TAG_NAME"
-          fi
+          event-type: emhass-branch-sync
+          client-payload: |-
+            {
+              "branch_name": "${{ needs.get-branch-info.outputs.branch_name }}",
+              "commit_sha": "${{ needs.get-branch-info.outputs.commit_sha }}",
+              "short_sha": "${{ needs.get-branch-info.outputs.short_sha }}",
+              "base_version": "${{ needs.get-branch-info.outputs.base_version }}"
+            }
