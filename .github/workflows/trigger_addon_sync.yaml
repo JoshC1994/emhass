@@ -1,4 +1,4 @@
-name: Trigger Addon Sync on Commit
+name: Sync to Addon on Commit
 
 on:
   push:
@@ -8,15 +8,97 @@ on:
       - '.github/workflows/trigger_addon_sync.yaml'
 
 jobs:
-  trigger-sync:
+  sync-to-addon:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - name: Trigger emhass-add-on sync workflow
+      - name: Checkout emhass
+        uses: actions/checkout@v4
+        with:
+          path: emhass
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout emhass-add-on
+        uses: actions/checkout@v4
+        with:
+          repository: JoshC1994/emhass-add-on
+          path: emhass-add-on
+          token: ${{ secrets.ADDON_PAT }}
+
+      - name: Sync emhass into addon
         run: |
-          curl -X POST \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Authorization: token ${{ secrets.ADDON_SYNC_TOKEN }}" \
-            https://api.github.com/repos/JoshC1994/emhass-add-on/actions/workflows/sync_branch_addon.yaml/dispatches \
-            -d '{"ref":"main","inputs":{"source_branch":"master","target_branch":"main"}}'
+          cd emhass-add-on
           
-          echo "Triggered sync workflow in emhass-add-on"
+          # Remove old emhass code (but keep addon config)
+          rm -rf emhass/CHANGELOG.md emhass/DOCS.md emhass/README.md emhass/Test.md emhass/config.yml emhass/icon.png emhass/logo.png emhass/images emhass/translations
+          
+          # Copy new emhass code
+          cp -r ../emhass/. emhass/
+          
+          echo "Synced emhass into addon"
+
+      - name: Get version from emhass
+        id: version
+        run: |
+          cd emhass
+          BASE_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2 || echo "0.18.1")
+          echo "BASE_VERSION=$BASE_VERSION" >> $GITHUB_OUTPUT
+          
+          EMHASS_SHA=$(git rev-parse --short=7 HEAD)
+          echo "EMHASS_SHA=$EMHASS_SHA" >> $GITHUB_OUTPUT
+
+      - name: Get addon commit SHA
+        id: addon_commit
+        run: |
+          cd emhass-add-on
+          ADDON_SHA=$(git rev-parse --short=7 HEAD)
+          echo "ADDON_SHA=$ADDON_SHA" >> $GITHUB_OUTPUT
+
+      - name: Update addon config.yml
+        run: |
+          cd emhass-add-on
+          
+          BASE_VERSION="${{ steps.version.outputs.BASE_VERSION }}"
+          ADDON_SHA="${{ steps.addon_commit.outputs.ADDON_SHA }}"
+          FULL_VERSION="v${BASE_VERSION}-${ADDON_SHA}"
+          
+          # Update version
+          sed -i "s/^version: .*/version: \"$FULL_VERSION\"/" emhass/config.yml
+          
+          # Update name
+          sed -i "s/^name: .*/name: \"EMHASS - master\"/" emhass/config.yml
+          
+          echo "Updated to $FULL_VERSION"
+
+      - name: Commit and push to addon
+        run: |
+          cd emhass-add-on
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            BASE_VERSION="${{ steps.version.outputs.BASE_VERSION }}"
+            git commit -m "Auto-sync from emhass v${BASE_VERSION}"
+            git push origin main
+          fi
+
+      - name: Create Git tag
+        run: |
+          cd emhass-add-on
+          BASE_VERSION="${{ steps.version.outputs.BASE_VERSION }}"
+          ADDON_SHA="${{ steps.addon_commit.outputs.ADDON_SHA }}"
+          TAG_NAME="v${BASE_VERSION}-${ADDON_SHA}"
+          
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag exists"
+          else
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git tag -a "$TAG_NAME" -m "Auto-release $TAG_NAME"
+            git push origin "$TAG_NAME"
+            echo "Created tag: $TAG_NAME"
+          fi
