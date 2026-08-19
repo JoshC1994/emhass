@@ -5,11 +5,23 @@
 ## docker run --rm -it -p 5000:5000 --name emhass-container -v ./config.json:/share/config.json -v ./secrets_emhass.yaml:/app/secrets_emhass.yaml emhass
 
 # armhf,amd64,armv7,aarch64
-ARG TARGETARCH
-# armhf=raspbian, amd64,armv7,aarch64=debian
 ARG os_version=debian
 
-FROM ghcr.io/home-assistant/$TARGETARCH-base-$os_version:bookworm AS base
+# Home Assistant base images are named amd64 / aarch64 / armv7 / armhf.
+# Docker/buildx auto-populate TARGETARCH per --platform using its own
+# Go-style names instead: amd64 / arm64 / arm. Define one stage per HA
+# name, then alias the Go-style names to them, so this works whether
+# TARGETARCH was set automatically by buildx (CI multi-platform builds)
+# or passed manually via --build-arg (local single-platform builds).
+FROM ghcr.io/home-assistant/amd64-base-$os_version:bookworm   AS base-amd64
+FROM ghcr.io/home-assistant/aarch64-base-$os_version:bookworm AS base-aarch64
+FROM ghcr.io/home-assistant/armv7-base-$os_version:bookworm   AS base-armv7
+FROM ghcr.io/home-assistant/armhf-base-raspbian:bookworm      AS base-armhf
+
+FROM base-aarch64 AS base-arm64
+FROM base-armv7   AS base-arm
+
+FROM base-${TARGETARCH} AS base
 
 # check if TARGETARCH was passed by build-arg
 ARG TARGETARCH
