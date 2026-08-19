@@ -31,8 +31,17 @@ jobs:
           BRANCH="${{ github.ref_name }}"
           echo "branch_name=$BRANCH" >> $GITHUB_OUTPUT
           echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
-          VERSION=$(grep -m1 '^version\s*=' pyproject.toml | cut -d'"' -f2)
+          
+          # Try multiple ways to extract version
+          VERSION=$(grep -E '^version\s*=' pyproject.toml | head -1 | sed 's/version\s*=\s*"\([^"]*\)".*/\1/' || echo "0.0.0")
+          if [ -z "$VERSION" ]; then
+            VERSION="0.0.0"
+          fi
           echo "base_version=$VERSION" >> $GITHUB_OUTPUT
+          
+          echo "Extracted version: $VERSION"
+          echo "Branch: $BRANCH"
+          echo "SHA: $(echo ${{ github.sha }} | cut -c1-7)"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
