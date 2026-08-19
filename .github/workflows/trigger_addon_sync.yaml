@@ -3,63 +3,71 @@ name: Trigger Addon Sync
 on:
   push:
     branches:
-      - '*'
+      - '**'
+
   workflow_dispatch:
     inputs:
       target_branch:
-        description: 'Branch to sync'
+        description: Branch to synchronise
         required: false
         default: ''
+        type: string
 
 jobs:
-  get-branch-info:
+  dispatch-addon-sync:
+    name: Dispatch branch data to add-on repository
     runs-on: ubuntu-latest
-    outputs:
-      branch_name: ${{ steps.get-branch.outputs.branch }}
-      commit_sha: ${{ steps.get-branch.outputs.sha }}
-      short_sha: ${{ steps.get-branch.outputs.short_sha }}
-      base_version: ${{ steps.get-version.outputs.base_version }}
+
     steps:
-      - name: Checkout repository
+      - name: Check out EMHASS
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.target_branch || github.ref }}
           fetch-depth: 1
 
-      - name: Get branch name
-        id: get-branch
+      - name: Calculate version and branch data
+        id: values
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            BRANCH="${{ github.event.inputs.target_branch }}"
-            if [ -z "$BRANCH" ]; then
-              BRANCH="${{ github.ref_name }}"
-            fi
-          else
-            BRANCH="${{ github.ref_name }}"
+          set -euo pipefail
+
+          branch="${{ inputs.target_branch || github.ref_name }}"
+          commit_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+
+          base_version="$(
+            grep -E '^[[:space:]]*version[[:space:]]*=' pyproject.toml \
+              | head -n 1 \
+              | sed -E 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*["'\'']([^"'\'']+)["'\''].*/\1/'
+          )"
+
+          if [ -z "$base_version" ]; then
+            echo "Could not determine base version from pyproject.toml."
+            exit 1
           fi
-          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
-          echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
-          echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
-      - name: Get base version from pyproject.toml
-        id: get-version
-        run: |
-          VERSION=$(grep -m1 '^version\s*=' pyproject.toml | cut -d'"' -f2)
-          echo "base_version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Branch: $branch"
+          echo "Commit SHA: $commit_sha"
+          echo "Short SHA: $short_sha"
+          echo "Base version: $base_version"
 
-  dispatch-to-addon-repo:
-    needs: get-branch-info
-    runs-on: ubuntu-latest
-    steps:
-      - name: Repository Dispatch
+          {
+            echo "branch=$branch"
+            echo "commit_sha=$commit_sha"
+            echo "short_sha=$short_sha"
+            echo "base_version=$base_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Trigger add-on repository workflow
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.ADDON_SYNC_TOKEN }}
           repository: JoshC1994/emhass-add-on
           event-type: emhass-branch-sync
-          client-payload: |-
+          client-payload: >-
             {
-              "branch_name": "${{ needs.get-branch-info.outputs.branch_name }}",
-              "commit_sha": "${{ needs.get-branch-info.outputs.commit_sha }}",
-              "short_sha": "${{ needs.get-branch-info.outputs.short_sha }}",
-              "base_version": "${{ needs.get-branch-info.outputs.base_version }}"
+              "branch_name": "${{ steps.values.outputs.branch }}",
+              "commit_sha": "${{ steps.values.outputs.commit_sha }}",
+              "short_sha": "${{ steps.values.outputs.short_sha }}",
+              "base_version": "${{ steps.values.outputs.base_version }}"
             }
