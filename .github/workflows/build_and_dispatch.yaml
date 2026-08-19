@@ -5,12 +5,22 @@ name: Build and dispatch branch image to add-on repo
 #   emhass-add-on repo to create/update a matching add-on folder.
 # - On delete: tells the emhass-add-on repo to remove that branch's
 #   add-on folder so it disappears from the Home Assistant store.
+#
+# master/main pushes reuse the existing "emhass" image name so the
+# add-on you already have installed in Home Assistant just receives
+# updates in place. Every other branch gets its own "emhass-<slug>"
+# image and its own add-on entry.
 
 on:
   push:
     branches:
       - '**'
   delete:
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-dispatch-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -22,7 +32,7 @@ env:
 
 jobs:
   compute-slug:
-    if: github.event_name == 'push' || github.event.ref_type == 'branch'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.ref_type == 'branch'
     runs-on: ubuntu-latest
     outputs:
       branch: ${{ steps.vars.outputs.branch }}
@@ -51,8 +61,9 @@ jobs:
 
   build-and-push:
     needs: compute-slug
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,8 +85,19 @@ jobs:
         id: tags
         run: |
           SLUG="${{ needs.compute-slug.outputs.slug }}"
+          IS_MASTER="${{ needs.compute-slug.outputs.is_master }}"
           OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          BASE="ghcr.io/${OWNER_LC}/${{ env.IMAGE_NAME }}-${SLUG}"
+
+          if [ "$IS_MASTER" = "true" ]; then
+            # Keep using the same image name the already-installed
+            # add-on pulls from, so it just gets updated in place.
+            IMAGE_REPO="${{ env.IMAGE_NAME }}"
+          else
+            IMAGE_REPO="${{ env.IMAGE_NAME }}-${SLUG}"
+          fi
+
+          BASE="ghcr.io/${OWNER_LC}/${IMAGE_REPO}"
+          echo "image_repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "run_tag=${BASE}:${{ github.run_number }}" >> "$GITHUB_OUTPUT"
           echo "latest_tag=${BASE}:latest" >> "$GITHUB_OUTPUT"
@@ -87,12 +109,34 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
+          # provenance/sbom attestations are a common cause of
+          # multi-platform + multi-tag pushes to GHCR failing almost
+          # instantly - disable them, we don't need them here.
+          provenance: false
+          sbom: false
           tags: |
             ${{ steps.tags.outputs.run_tag }}
             ${{ steps.tags.outputs.latest_tag }}
-          build-args: |
-            BUILD_VERSION=${{ github.run_number }}
-            BUILD_FROM=ghcr.io/hassio-addons/base/amd64:15.0.7
+          cache-from: type=gha,scope=${{ needs.compute-slug.outputs.slug }}
+          cache-to: type=gha,mode=max,scope=${{ needs.compute-slug.outputs.slug }}
+
+      - name: Make GHCR package public
+        # Home Assistant pulls images anonymously, so every new
+        # package (each new branch creates one) needs to be public.
+        # GITHUB_TOKEN cannot change package visibility, so this uses
+        # the same PAT used for the repository_dispatch below.
+        # Safe to run every time (idempotent) and never fatal.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.ADDON_REPO_TOKEN }}
+          PACKAGE: ${{ steps.tags.outputs.image_repo }}
+        run: |
+          curl -sS -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user/packages/container/${PACKAGE}" \
+            -d '{"visibility":"public"}'
 
       - name: Dispatch update to add-on repo
         uses: peter-evans/repository-dispatch@v3
