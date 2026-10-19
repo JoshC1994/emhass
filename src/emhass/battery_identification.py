@@ -650,3 +650,150 @@ class BatteryIdentification:
                 f"from {n_chg} charge / {n_dis} discharge segments."
             )
         return result
+def build_battery_intervals(
+    power: pd.Series,
+    soc: pd.Series,
+    max_soc_gap: pd.Timedelta,
+    max_power_staleness: pd.Timedelta,
+) -> pd.DataFrame:
+    """
+    Build energy-balance intervals from raw power and SoC observations.
+
+    Each interval runs between two consecutive real SoC observations. Power is
+    integrated from raw power samples over exactly that interval.
+
+    This avoids the bias introduced by averaging sparse, change-only recorder
+    samples into fixed resample buckets before estimating battery throughput.
+
+    Parameters
+    ----------
+    power:
+        Raw signed battery power samples, indexed by timestamp.
+        Positive values are treated as charging after sign auto-detection.
+    soc:
+        Raw battery state-of-charge samples, indexed by timestamp.
+    max_soc_gap:
+        Maximum permitted interval between two real SoC observations. Longer
+        intervals are treated as recorder/data outages and are not bridged.
+    max_power_staleness:
+        Maximum permitted gap between real power observations inside an
+        interval. Longer power silences are treated as outages.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame indexed by interval start time, with columns:
+
+        - ``end``: interval end timestamp
+        - ``soc_start``: SoC at interval start
+        - ``soc_end``: SoC at interval end
+        - ``energy_wh``: signed integrated battery energy, Wh
+        - ``duration``: interval duration
+    """
+    empty_columns = [
+        "end",
+        "soc_start",
+        "soc_end",
+        "energy_wh",
+        "duration",
+    ]
+
+    if power is None or soc is None or power.empty or soc.empty:
+        return pd.DataFrame(columns=empty_columns)
+
+    power = power.dropna().sort_index()
+    soc = soc.dropna().sort_index()
+
+    if len(power) < 2 or len(soc) < 2:
+        return pd.DataFrame(columns=empty_columns)
+
+    power_times = power.index.view("int64")
+    power_values = power.to_numpy(dtype=float)
+
+    soc_times = soc.index.view("int64")
+    soc_values = soc.to_numpy(dtype=float)
+
+    max_gap_ns = max_soc_gap.value
+    max_staleness_ns = max_power_staleness.value
+
+    records: list[dict[str, object]] = []
+
+    for i in range(len(soc) - 1):
+        start_ns = int(soc_times[i])
+        end_ns = int(soc_times[i + 1])
+        gap_ns = end_ns - start_ns
+
+        # A long interval between real SoC observations is a recorder or data
+        # outage. The battery state across it is unobserved, so it must not be
+        # bridged or used to manufacture throughput.
+        if gap_ns > max_gap_ns:
+            continue
+
+        power_mask = (power_times >= start_ns) & (power_times <= end_ns)
+        interval_power_times = power_times[power_mask]
+        interval_power_values = power_values[power_mask]
+
+        if len(interval_power_times) == 0:
+            continue
+
+        # Include power at the exact SoC interval endpoints. This avoids
+        # assuming that the first or last raw power sample coincides with the
+        # SoC observation.
+        start_power = float(
+            np.interp(start_ns, power_times, power_values)
+        )
+        end_power = float(
+            np.interp(end_ns, power_times, power_values)
+        )
+
+        integration_times = np.concatenate(
+            (
+                np.array([start_ns]),
+                interval_power_times,
+                np.array([end_ns]),
+            )
+        )
+        integration_values = np.concatenate(
+            (
+                np.array([start_power]),
+                interval_power_values,
+                np.array([end_power]),
+            )
+        )
+
+        # Reject the interval if power was stale for too long. This prevents a
+        # held non-zero value from fabricating energy across an outage.
+        if len(interval_power_times) >= 2:
+            largest_power_gap = int(np.max(np.diff(interval_power_times)))
+        else:
+            largest_power_gap = gap_ns
+
+        if largest_power_gap > max_staleness_ns:
+            continue
+
+        # Trapezoidal integration. Timestamps are in nanoseconds, so divide by
+        # 3.6e12 to convert W * ns to Wh.
+        energy_wh = float(
+            np.trapz(integration_values, integration_times) / 3.6e12
+        )
+
+        records.append(
+            {
+                "end": pd.Timestamp(end_ns, tz="UTC"),
+                "soc_start": float(soc_values[i]),
+                "soc_end": float(soc_values[i + 1]),
+                "energy_wh": energy_wh,
+                "duration": pd.Timedelta(gap_ns),
+            }
+        )
+
+    if not records:
+        return pd.DataFrame(columns=empty_columns)
+
+    interval_starts = [
+        record["end"] - record["duration"] for record in records
+    ]
+
+    return pd.DataFrame(records).set_index(
+        pd.DatetimeIndex(interval_starts)
+    )
