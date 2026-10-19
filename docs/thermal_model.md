@@ -43,7 +43,7 @@ You can define the following parameters inside the `thermal_config` dictionary:
 
 * **heating_rate**: The rate at which the temperature changes per hour when the device is operating at nominal power.
 * **cooling_constant**: The rate at which temperature is lost to the environment (per hour per degree difference).
-* **thermal_inertia**: (Float, Default: 0.0) The thermal lag of the system in hours. This models the delay between the device turning on and the temperature effectively starting to change. For example, `1.0` means a 1-hour delay.
+* **thermal_inertia**: (Float, Default: 0.0) The thermal lag of the system in hours. This models the delay between the device turning on and the temperature effectively starting to change. For example, `1.0` means a 1-hour delay. The lag is applied in whole timesteps (the value is divided by the optimization time step and rounded down, so `0.75` at a 30-minute step is a 1-step lag) and is capped at the optimization horizon.
 * **start_temperature**: The initial room temperature.
 * **sense**: Defines the operation mode of the thermal load.
     * `'heat'`: (Default) The device adds heat (e.g., heater).
@@ -53,7 +53,7 @@ You can define the following parameters inside the `thermal_config` dictionary:
 * **min_temperatures**: (List of floats) The minimum allowed temperature per timestep.
 * **max_temperatures**: (List of floats) The maximum allowed temperature per timestep.
 * **desired_temperatures**: (Legacy) A specific target temperature per timestep. Used with `penalty_factor`.
-* **overshoot_temperature**: (Legacy) A global maximum temperature limit.
+* **overshoot_temperature**: (Legacy) A global maximum temperature limit. Used with `desired_temperatures`: the load does not heat (or cool) in a step that would end beyond it, whether it is semi-continuous or continuous. A semi-continuous load that would cross it in one step at full power is off for that step.
 
 **Note on Constraint Modes:**
 It is recommended to use `min_temperatures` and `max_temperatures` to define a "Comfort Range". This allows the optimizer to "float" the temperature within this range to find the cheapest time to operate, resulting in clear On/Off blocks.

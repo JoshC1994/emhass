@@ -41,6 +41,29 @@ const BATTERY_ARRAY_PARAMS = [
   "battery_soc_surplus_cost",
 ];
 
+//#1116: the per-load array params in the "Deferrable Loads" section whose
+//cardinality is driven by number_of_deferrable_loads (mirrors
+//BATTERY_ARRAY_PARAMS/number_of_batteries above). heat_topology is
+//deliberately excluded - it is a single object param (input: "object"), not
+//a per-load array.* value, so it must stay exactly one input regardless of
+//number_of_deferrable_loads.
+const DEFERRABLE_ARRAY_PARAMS = [
+  "nominal_power_of_deferrable_loads",
+  "minimum_power_of_deferrable_loads",
+  "cost_forecast_per_deferrable_load",
+  "is_electric_load",
+  "operating_hours_of_each_deferrable_load",
+  "treat_deferrable_load_as_semi_cont",
+  "set_deferrable_load_single_constant",
+  "set_deferrable_startup_penalty",
+  "deferrable_load_max_cost",
+  "set_deferrable_max_startups",
+  "def_minimum_on_time",
+  "def_minimum_off_time",
+  "start_timesteps_of_each_deferrable_load",
+  "end_timesteps_of_each_deferrable_load",
+];
+
 //on page reload
 window.onload = async function () {
   ///fetch configuration parameters from definitions json file
@@ -311,17 +334,26 @@ function buildParamContainers(
       continue;
     }
 
-    //if parameter type == array.* and not in "Deferrable Loads" or "Battery" section,
-    //append plus and minus buttons in param div. Battery is excluded the same way
-    //Deferrable Loads is (#610): the 15 per-battery array params
-    //(BATTERY_ARRAY_PARAMS) are length-managed exclusively by the
-    //number_of_batteries header count below, so no free +/- button can desync a
-    //param's length from number_of_batteries and crash check_batt_params on save.
+    //if parameter type == array.*, append plus and minus buttons in param div so
+    //the user can grow/shrink the list. Two groups of array.* params are excluded
+    //because their length is managed elsewhere: the DEFERRABLE_ARRAY_PARAMS in
+    //the "Deferrable Loads" section (by number_of_deferrable_loads) and the 15
+    //BATTERY_ARRAY_PARAMS in the "Battery" section (by number_of_batteries) - a
+    //free +/- button on those would desync their length and crash
+    //check_batt_params/check_def_loads on save. Any other array.* param in
+    //either section (e.g. the #540 Part B capacity_cost_per_kw /
+    //capacity_charge_interval_timesteps in Battery, which are NOT per-battery)
+    //still gets the normal generic +/- controls - the two allow-lists, not the
+    //section name, own cardinality.
     let array_buttons = "";
     if (
       parameter_definition_object["input"].search("array.") > -1 &&
-      section != "Deferrable Loads" &&
-      section != "Battery"
+      !(
+        parameter_definition_object["input"] === "array.array.float" &&
+        Array.isArray(parameter_definition_object["default_value"])
+      ) &&
+      !(section == "Deferrable Loads" && DEFERRABLE_ARRAY_PARAMS.includes(parameter_definition_name)) &&
+      !(section == "Battery" && BATTERY_ARRAY_PARAMS.includes(parameter_definition_name))
     ) {
       array_buttons = `
                   <button type="button" class="input-plus ${parameter_definition_name}">+</button>
@@ -352,10 +384,21 @@ function buildParamContainers(
 
   //after looping though, build and appending the parameters in the corresponding section:
   //create add button (array plus) event listeners
+  //plusElements() indexes its 2nd arg as param_definitions[section][name]; this
+  //function only receives the single section's definitions, so wrap them back
+  //under the section key. (The bare `param_definitions` used here previously is
+  //not in this function's scope - the generic +/- path threw ReferenceError on
+  //click; it was only ever reached by load_peak_hour_periods until #540 Part B
+  //routed capacity_cost_per_kw / capacity_charge_interval_timesteps through it.)
   let plus = SectionContainer.querySelectorAll(".input-plus");
   plus.forEach(function (answer) {
     answer.addEventListener("click", () =>
-      plusElements(answer.classList[1], param_definitions, section, {})
+      plusElements(
+        answer.classList[1],
+        { [section]: section_parameters_definitions },
+        section,
+        {}
+      )
     );
   });
 
@@ -476,7 +519,13 @@ function buildParamElement(
               <span class="slider"></span>
               </label>
               `;
-      placeholder = parameter_definition_object["default_value"] === "true";
+      //#1116: default_value comes straight from the JSON definitions file, so a
+      //declared boolean default (e.g. is_electric_load: true) parses as an
+      //actual JS boolean, not the string "true" - comparing only against the
+      //string left every declared-true default computing to false.
+      placeholder =
+        parameter_definition_object["default_value"] === true ||
+        parameter_definition_object["default_value"] === "true";
       break;
     //selects (pick)
     case "select":
@@ -496,6 +545,39 @@ function buildParamElement(
   //check if a param value is saved in the config file (if so overwrite definition default)
   let value = checkConfigParam(placeholder, config, parameter_definition_name);
 
+  // A static numeric table (array.array.float with a list default, e.g. the
+  // battery charge derating or the inverter power curves) uses one JSON field.
+  // Per-load nested arrays declare a null default, may hold null entries and
+  // keep their own per-load rendering and save paths.
+  if (parameter_definition_object["input"] === "array.array.float" &&
+      Array.isArray(parameter_definition_object["default_value"])) {
+    const json = typeof value === "string" ? value : JSON.stringify(value ?? []);
+    const escaped = json.replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+    return `<input class="param_input" type="text" placeholder="[]" value="${escaped}">`;
+  }
+  // Object parameters (nested JSON such as heat_topology) get a multi-line
+  // textarea: a one-line <input> is unusable for large nested structures.
+  // Absent config, JSON null and the legacy string "null" all render as an
+  // empty box. Content is entity-escaped; the browser decodes it back, so the
+  // value round-trips through saveConfiguration's JSON.parse unchanged.
+  if (parameter_definition_object["input"] === "object") {
+    let json_text = "";
+    if (value !== null && value !== undefined && value !== "" && value !== "null") {
+      json_text = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+    }
+    json_text = json_text
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+    const placeholder_attr = String(placeholder ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+    return `<textarea class="param_input param-json" rows="10" spellcheck="false" placeholder="${placeholder_attr}">${json_text}</textarea>`;
+  }
+
   //generate and return param input html,
   //check if param value is not an object, if so assume its a single value.
   if (typeof value !== "object") {
@@ -513,9 +595,14 @@ function buildParamElement(
     }
     // generate param input html and return
     else {
+      //#1116: set the checked attribute directly at render time - dynamically
+      //added rows (plusElements) never run buildParamContainers' one-time
+      //checkbox normalisation pass, so a checkbox created there must already
+      //reflect its true/false value without relying on that later pass.
+      let checked_attr = type === "checkbox" && value === true ? "checked" : "";
       return `
           ${type_specific_html}
-          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${value} >
+          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${value} ${checked_attr}>
           ${type_specific_html_end}
           `;
     }
@@ -529,10 +616,6 @@ function buildParamElement(
           <input class="param_input" type="${type}" placeholder="${placeholder}" value="">
           ${type_specific_html_end}
           `;
-    }
-    // The nested-object path below is designed only for load_peak_hour_periods.
-    if (parameter_definition_object["input"] === "object") {
-      return `<input class="param_input" type="text" placeholder="${placeholder}" value="${JSON.stringify(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')}">`;
     }
     //for items such as load_peak_hour_periods (object of objects with arrays)
     // exclude null: typeof null === "object" is a JS gotcha — null elements must fall to the array branch
@@ -551,9 +634,13 @@ function buildParamElement(
     else {
       let inputs = "";
       for (let param of value) {
+        //#1116: same as the single-value branch above - set checked directly
+        //so a freshly-created array.boolean row (e.g. adding a deferrable
+        //load) starts in the correct state without a separate normalisation pass.
+        let checked_attr = type === "checkbox" && param === true ? "checked" : "";
         inputs += `
           ${type_specific_html}
-          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${param}>
+          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${param} ${checked_attr}>
           ${type_specific_html_end}
           `;
       }
@@ -578,16 +665,28 @@ function plusElements(
   }
   let param_input_container =
     param_element.getElementsByClassName("param-input")[0];
-  // Add a copy of the param element
-  param_input_container.innerHTML += buildParamElement(
-    param_definitions[section][parameter_definition_name],
-    parameter_definition_name,
-    config
+  // Append a new input WITHOUT re-serialising the existing ones. `innerHTML +=`
+  // would round-trip every sibling through its HTML string form, which only
+  // carries the `value` attribute - any value the user has typed but not saved
+  // lives on the input's `.value` property and would be reset (e.g. entering
+  // 3, 7 then removing and re-adding the 2nd row blanked the first back to its
+  // default). insertAdjacentHTML parses and inserts only the new node.
+  param_input_container.insertAdjacentHTML(
+    "beforeend",
+    buildParamElement(
+      param_definitions[section][parameter_definition_name],
+      parameter_definition_name,
+      config
+    )
   );
 }
 
-//Remove param inputs in param div container (minimum 1)
-function minusElements(param) {
+//Remove param inputs in param div container (minimum `minimum_inputs`, default 1).
+//#1116: the deferrable-loads shrink path passes 0 so number_of_deferrable_loads
+//can reach 0 (EMHASS accepts num_def_loads=0); every other caller (generic
+//+/-, number_of_batteries) omits the argument and keeps the prior minimum-1
+//floor unchanged.
+function minusElements(param, minimum_inputs = 1) {
   let param_element = document.getElementById(param);
   let param_input
   if (param_element == null) {
@@ -621,7 +720,7 @@ function minusElements(param) {
       param_input_list[param_input_list.length - 1].remove();
       brs[brs.length - 1].remove();
     }
-  } else if (param_input_list.length > 1) {
+  } else if (param_input_list.length > minimum_inputs) {
     param_input.remove();
   }
 }
@@ -703,19 +802,25 @@ function headerElement(element, param_definitions, config) {
       break;
 
     //if number_of_deferrable_loads, the number of inputs in the "Deferrable Loads" section should add up to number_of_deferrable_loads value in header
+    //#1116: only the genuine per-load array params (DEFERRABLE_ARRAY_PARAMS) are
+    //grown/shrunk here - not every ".param" in the section, since heat_topology
+    //is a single object param whose cardinality is not tied to
+    //number_of_deferrable_loads (mirrors the number_of_batteries case below).
     case "number_of_deferrable_loads":
-      //get a list of param in section
-      param_list = param_container.getElementsByClassName("param");
+      //get a list of only the deferrable-load array params in section
+      param_list = Array.from(
+        param_container.getElementsByClassName("param")
+      ).filter((p) => DEFERRABLE_ARRAY_PARAMS.includes(p.id));
       if (param_list.length <= 0) {
         console.log(
           "There has been an issue counting the amount of params in number_of_deferrable_loads"
         );
         return 1;
       }
-      //calculate how much off the fist parameters input elements amount to is, compering to the number_of_deferrable_loads value
+      //calculate how much off the first deferrable-load array param's input elements amount to is, comparing to the number_of_deferrable_loads value
       difference =
         Number.parseInt(element.value) -
-        param_container.firstElementChild.querySelectorAll("input").length;
+        param_list[0].querySelectorAll("input").length;
       //add elements based on how many elements are missing
       if (difference > 0) {
         for (let i = difference; i >= 1; i--) {
@@ -726,10 +831,13 @@ function headerElement(element, param_definitions, config) {
         }
       }
       //subtract elements based how many elements its over
+      //#1116: pass minimum 0 - number_of_deferrable_loads may reach 0 (EMHASS
+      //accepts num_def_loads=0), unlike the generic/battery paths below which
+      //keep the default minimum-1 floor.
       if (difference < 0) {
         for (let i = difference; i <= -1; i++) {
           for (const param of param_list) {
-            minusElements(param.id);
+            minusElements(param.id, 0);
           }
         }
       }
@@ -805,7 +913,7 @@ async function saveConfiguration(param_definitions) {
   if (Boolean(config_card.length)) {
     //retrieve params and their input/s by looping though param_definitions list
     //loop through the sections
-    for (const [, section_object] of Object.entries(
+    for (const [section, section_object] of Object.entries(
       param_definitions
     )) {
       //loop through parameters
@@ -854,9 +962,33 @@ async function saveConfiguration(param_definitions) {
 
           //build parameters using values extracted from param_inputs
 
-          // object-type: JSON.parse the text-box value; treat "" and "null" as JSON null
+          // Static numeric tables must be saved as JSON, not flattened strings.
+          // Only the structure is checked here; the physics of each table is
+          // validated authoritatively in Python.
+          if (parameter_definition_object["input"] === "array.array.float" &&
+              Array.isArray(parameter_definition_object["default_value"])) {
+            try {
+              const value = JSON.parse((param_values[0] ?? "").trim() || "[]");
+              const numericRow = (row) => Array.isArray(row) &&
+                row.every((item) => typeof item === "number" && Number.isFinite(item));
+              const numericTable = (table) => Array.isArray(table) && table.every(numericRow);
+              if (!numericTable(value) &&
+                  !(Array.isArray(value) && value.every(numericTable))) {
+                throw new Error("Expected nested numeric arrays");
+              }
+              config[parameter_definition_name] = value;
+            } catch (_) {
+              errorAlert(parameter_definition_name + ": enter a JSON array of numeric rows or tables, for example [[0.5, 0.84]].");
+              return 0;
+            }
+            continue;
+          }
+
+          // object-type: JSON.parse the textarea value; treat "" and "null" as
+          // JSON null. Trim so stray whitespace/newlines in an otherwise empty
+          // textarea do not read as invalid JSON.
           if (parameter_definition_object["input"] === "object") {
-            const raw = (param_values[0] ?? "").toString();
+            const raw = (param_values[0] ?? "").toString().trim();
             if (raw === "" || raw === "null") {
               config[parameter_definition_name] = null;
             } else {
@@ -893,6 +1025,16 @@ async function saveConfiguration(param_definitions) {
           //array value
           else if (param_values.length) {
             config[parameter_definition_name] = param_values;
+          }
+          //#1116: Deferrable Loads may intentionally render zero managed rows
+          //when number_of_deferrable_loads=0. Submit those owned fields as []
+          //without changing zero-input save semantics for unrelated arrays.
+          else if (
+            param_array &&
+            section === "Deferrable Loads" &&
+            DEFERRABLE_ARRAY_PARAMS.includes(parameter_definition_name)
+          ) {
+            config[parameter_definition_name] = [];
           }
         }
       }

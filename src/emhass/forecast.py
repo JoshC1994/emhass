@@ -2,6 +2,12 @@ import asyncio
 import bz2
 import copy
 
+# Exclusive advisory lock for the Solcast quota counter file, so concurrent
+# EMHASS processes reserve provider-call budget atomically. POSIX uses
+# fcntl.flock; Windows uses msvcrt.locking on a single deterministic byte at
+# offset 0 (seek there before both lock and unlock). If neither primitive is
+# available the acquire raises, so the caller fails the reservation closed
+# rather than proceeding without atomicity.
 try:
     import fcntl as _fcntl
 
@@ -10,13 +16,27 @@ try:
 
     def _flock_release(f):
         _fcntl.flock(f, _fcntl.LOCK_UN)
-except ImportError:  # Windows
+except ImportError:
+    try:
+        import msvcrt as _msvcrt
 
-    def _flock_acquire(f):
-        pass  # type: ignore[misc]
+        def _flock_acquire(f):
+            f.seek(0)
+            _msvcrt.locking(f.fileno(), _msvcrt.LK_LOCK, 1)
 
-    def _flock_release(f):
-        pass  # type: ignore[misc]
+        def _flock_release(f):
+            f.seek(0)
+            _msvcrt.locking(f.fileno(), _msvcrt.LK_UNLCK, 1)
+    except ImportError:  # no supported locking primitive: fail closed
+
+        def _flock_acquire(f):
+            raise OSError(
+                "No file-locking primitive available (neither fcntl nor msvcrt); "
+                "refusing a non-atomic Solcast quota reservation."
+            )
+
+        def _flock_release(f):
+            pass
 
 
 import logging
@@ -34,6 +54,7 @@ import aiohttp
 import numpy as np
 import orjson
 import pandas as pd
+import pytz
 from pvlib.irradiance import disc
 from pvlib.location import Location
 from pvlib.modelchain import ModelChain
@@ -46,11 +67,21 @@ from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.retrieve_hass import RetrieveHass
-from emhass.utils import add_date_features, get_days_list, set_df_index_freq
+from emhass.utils import (
+    add_date_features,
+    add_local_calendar_days,
+    describe_invalid_forecast_value,
+    get_days_list,
+    get_forecast_start,
+    set_df_index_freq,
+)
 
 header_accept = "application/json"
 error_msg_list_not_long_enough = "Passed data from passed list is not long enough"
 error_msg_method_not_valid = "Passed method is not valid"
+error_msg_tariff_schedule_time_zone = (
+    "tariff_schedule_time_zone is not a valid time zone identifier: %r"
+)
 
 # Per-request timeout (seconds) for the Open-Meteo HTTP fetch. Without an
 # explicit timeout aiohttp's default is long, so a slow/hanging Open-Meteo
@@ -61,6 +92,51 @@ open_meteo_request_timeout = 12
 # is made and any failure falls back to the cache immediately (no added delay).
 open_meteo_max_attempts = 3
 open_meteo_backoff_seconds = (1, 2, 4)
+
+
+def _solcast_overlap_average(
+    period_starts: pd.DatetimeIndex,
+    period_ends: pd.DatetimeIndex,
+    period_power: np.ndarray,
+    target_starts: pd.DatetimeIndex,
+    target_step: pd.Timedelta,
+) -> np.ndarray:
+    """Overlap-weighted resampling of Solcast period-average power.
+
+    A Solcast row is the *average* power ``period_power[i]`` over the source
+    interval ``[period_starts[i], period_ends[i])`` -- not an instantaneous
+    sample at ``period_end``. Each optimisation interval is
+    ``[t, t + target_step)`` for ``t`` in ``target_starts``. The value
+    returned for that interval is::
+
+        sum_i(period_power[i] * overlap_seconds(source_i, target)) / target_step_seconds
+
+    i.e. the energy delivered by every overlapping *real* source interval,
+    divided by the full target duration. Consequences:
+
+    * a target wholly inside one source interval takes that interval's
+      average exactly (finer or equal grid);
+    * a target spanning several source intervals takes their
+      duration-weighted mean, so no source interval is ever dropped (coarser
+      or non-divisor grid, or a target that straddles a source boundary);
+    * any portion of a target with no delivered source data contributes
+      zero -- matching the "zero outside genuine provider coverage" contract
+      -- and an internal missing period is never held across.
+
+    Timestamps are compared as absolute instants, so a tz-aware UTC source
+    and a tz-aware local target grid line up correctly.
+    """
+    src_start = period_starts.to_numpy("datetime64[ns]")
+    src_end = period_ends.to_numpy("datetime64[ns]")
+    tgt_start = target_starts.to_numpy("datetime64[ns]")
+    step = np.timedelta64(target_step).astype("timedelta64[ns]")
+    tgt_end = tgt_start + step
+    lo = np.maximum(src_start[:, None], tgt_start[None, :])
+    hi = np.minimum(src_end[:, None], tgt_end[None, :])
+    overlap = (hi - lo).astype("timedelta64[ns]").astype("float64")
+    np.clip(overlap, 0.0, None, out=overlap)
+    energy = period_power[:, None] * overlap
+    return energy.sum(axis=0) / step.astype("float64")
 
 
 class Forecast:
@@ -101,9 +177,9 @@ class Forecast:
     data to electrical power. The PVLib module is used to model the PV plant.
 
     The specific methods for the load forecast are a first method (`naive`) that uses
-    a naive approach, also called persistance. It simply assumes that the forecast for
-    a future period will be equal to the observed values in a past period. The past
-    period is controlled using parameter `delta_forecast`. A second method (`mlforecaster`)
+    a naive approach, also called persistance. It simply assumes that the load at each
+    time of day will be equal to the load observed at the same time of day on the most
+    recent day where it is known (see `get_naive_load_forecast`). A second method (`mlforecaster`)
     uses an internal custom forecasting model using machine learning. There is a section
     in the documentation explaining how to use this method.
 
@@ -211,33 +287,54 @@ class Forecast:
         if (params is None) or (params == "null"):
             self.params = {}
         elif type(params) is dict:
-            self.params = params
+            # Work on a copy of passed_data: the captured forecast_start is consumed below, and a
+            # second Forecast built from the same dict must still see it (the runtime forecasts
+            # are aligned to that grid), not silently recompute another one.
+            self.params = {**params, "passed_data": dict(params.get("passed_data") or {})}
         else:
             self.params = orjson.loads(params)
 
-        if self.method_ts_round == "nearest":
-            # Round the start once, in UTC (no DST ambiguity there). A range built
-            # from an aligned start at a fixed freq is aligned by construction;
-            # rounding the built index stamp-by-stamp instead lets round-half-to-even
-            # collapse neighbouring stamps into duplicates whenever now() falls
-            # exactly on a half-interval boundary (HH:15:00 / HH:45:00 at 30 min).
-            self.start_forecast = (
-                pd.Timestamp.now(tz=self.time_zone)
-                .replace(microsecond=0)
-                .tz_convert("utc")
-                .round(self.freq)
-                .tz_convert(self.time_zone)
-            )
-        elif self.method_ts_round == "first":
-            self.start_forecast = (
-                pd.Timestamp.now(tz=self.time_zone).replace(microsecond=0).floor(freq=self.freq)
-            )
-        elif self.method_ts_round == "last":
-            self.start_forecast = (
-                pd.Timestamp.now(tz=self.time_zone).replace(microsecond=0).ceil(freq=self.freq)
-            )
-        else:
+        # The start is rounded once, on the UTC clock (see get_forecast_start). A range built
+        # from an aligned start at a fixed freq is aligned by construction; rounding the
+        # built index stamp-by-stamp instead lets round-half-to-even collapse neighbouring
+        # stamps into duplicates whenever now() falls exactly on a half-interval boundary
+        # (HH:15:00 / HH:45:00 at 30 min).
+        now = pd.Timestamp.now(tz=self.time_zone)
+        # A request that went through treat_runtimeparams carries the start it captured
+        # ("forecast_start", ISO 8601 with offset); reuse it so the runtime forecasts and this
+        # object share one grid. It is consumed here (single use), so a params dict that is
+        # reused for another request cannot pin an old grid. A malformed value is ignored with a
+        # warning. A well-formed one more than one step plus ten minutes from now is refused: the
+        # runtime forecasts were aligned to that grid, so building another one would silently
+        # shift them (fail closed instead of rebasing).
+        if self.method_ts_round not in ("nearest", "first", "last"):
             self.logger.error("Wrong method_ts_round passed parameter")
+            raise ValueError(
+                f"method_ts_round must be 'nearest', 'first' or 'last', got {self.method_ts_round!r}"
+            )
+        captured_start = None
+        frozen_start = (self.params.get("passed_data") or {}).pop("forecast_start", None)
+        if frozen_start:
+            try:
+                parsed_start = pd.Timestamp(frozen_start).tz_convert(self.time_zone)
+                if pd.isna(parsed_start):  # "NaT" parses without raising
+                    raise ValueError("NaT")
+                captured_start = parsed_start
+            except (ValueError, TypeError):
+                self.logger.warning("Ignoring malformed forecast_start %r", frozen_start)
+            else:
+                if abs(captured_start - now) > self.freq + pd.Timedelta(minutes=10):
+                    raise ValueError(
+                        f"forecast_start {frozen_start} is not from the current request (more than "
+                        f"one step plus ten minutes from now, {now}); the runtime forecasts were "
+                        "aligned to it, so the grid is not rebuilt"
+                    )
+        if captured_start is not None:
+            self.start_forecast = captured_start
+        else:
+            self.start_forecast = get_forecast_start(
+                now, self.freq, self.time_zone, self.method_ts_round
+            )
         # check if weather_forecast_cache, if so get 2x the amount of forecast
         _delta_days = self.optim_conf["delta_forecast_daily"].days
         if self.optim_conf["delta_forecast_daily"] != pd.Timedelta(days=_delta_days):
@@ -247,12 +344,12 @@ class Forecast:
                 _delta_days,
             )
         if self.params["passed_data"].get("weather_forecast_cache", False):
-            self.end_forecast = (self.start_forecast + pd.DateOffset(days=_delta_days * 2)).replace(
-                microsecond=0
+            self.end_forecast = add_local_calendar_days(
+                self.start_forecast, _delta_days * 2, self.time_zone
             )
         else:
-            self.end_forecast = (self.start_forecast + pd.DateOffset(days=_delta_days)).replace(
-                microsecond=0
+            self.end_forecast = add_local_calendar_days(
+                self.start_forecast, _delta_days, self.time_zone
             )
         self.forecast_dates = pd.date_range(
             start=self.start_forecast,
@@ -435,6 +532,9 @@ class Forecast:
                 self.optim_conf["open_meteo_cache_max_age"],
                 self.optim_conf["delta_forecast_daily"].days,
             )
+            if data_raw is None:
+                # Cold start: the request failed and there is no JSON cache to fall back to.
+                raise ValueError("Open-Meteo returned no forecast data and no cache is available")
             data_15min = pd.DataFrame.from_dict(data_raw["minutely_15"])
             # Date/times in the Open-Meteo JSON are unix timestamps
             data_15min["time"] = pd.to_datetime(data_15min["time"], unit="s", utc=True)
@@ -464,12 +564,8 @@ class Forecast:
                 limit_direction="both",
                 inplace=True,
             )
-            data = set_df_index_freq(data)
-            index_utc = data.index.tz_convert("utc")
-            index_tz = index_utc.round(
-                freq=data.index.freq, ambiguous="infer", nonexistent="shift_forward"
-            ).tz_convert(self.time_zone)
-            data.index = index_tz
+            # The index is already self.forecast_dates (aligned by construction);
+            # re-rounding it in UTC would collapse grids that are not UTC-aligned.
             data = set_df_index_freq(data)
             # Convert mm to cm and clip minimum to 0.1 cm
             data["precipitable_water"] = (data["precipitable_water"] / 10).clip(lower=0.1)
@@ -491,13 +587,16 @@ class Forecast:
                 return await self._get_weather_open_meteo(w_forecast_cache_path, use_legacy_pvlib)
         return data
 
-    def _solcast_rate_limit_ok(self, max_calls: int = 8) -> bool:
-        """Check and increment a daily Solcast API call counter.
+    def _solcast_rate_limit_ok(self, required_calls: int = 1, max_calls: int = 8) -> bool:
+        """Atomically reserve `required_calls` of Solcast provider-call budget.
 
-        Uses a file in temporary directory keyed by date. Returns True if under
-        the daily limit, False otherwise.
+        This is a reservation, not a count of calls actually transmitted: it
+        may exceed the real number sent if a later roof in the same refresh
+        fails first -- intentionally conservative to avoid a partial
+        aggregate. Keyed by UTC date, since Solcast's quota is UTC-day based.
+        Returns True (and reserves) if it fits under max_calls, else False.
         """
-        today = pd.Timestamp.now(tz=self.time_zone).strftime("%Y-%m-%d")
+        today = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
         temp_dir = tempfile.gettempdir()
         counter_path = os.path.join(temp_dir, f"emhass_solcast_calls_{today}.count")
 
@@ -511,14 +610,14 @@ class Forecast:
                 content = f.read().strip()
                 count = int(content) if content else 0
 
-                if count >= max_calls:
+                if count + required_calls > max_calls:
                     _flock_release(f)
                     return False
 
                 # Write incremented count back
                 f.seek(0)
                 f.truncate()
-                f.write(str(count + 1))
+                f.write(str(count + required_calls))
                 f.flush()
                 # Explicit close/unlock occurs via context manager exit, but we unlock explicitly
                 _flock_release(f)
@@ -595,17 +694,34 @@ class Forecast:
                 "Bypassing 'weather_forecast_cache_only' flag to fetch and cache a fresh forecast."
             )
             # Do NOT return False. We'll let execution continue below to fetch normally.
-        if not self._solcast_rate_limit_ok():
-            self.logger.warning(
-                "Solcast daily API call limit reached (safety cap). "
-                "Skipping live API call to preserve quota."
-            )
-            return False
         if "solcast_api_key" not in self.retrieve_hass_conf:
             self.logger.error("The solcast_api_key parameter was not defined")
             return False
         if "solcast_rooftop_id" not in self.retrieve_hass_conf:
             self.logger.error("The solcast_rooftop_id parameter was not defined")
+            return False
+        # Determine the configured rooftop request count before any quota
+        # reservation. Drop empty tokens so an empty / whitespace / separator-
+        # only value does not reserve a bogus one-call budget or issue a
+        # request against an empty rooftop ID.
+        roof_ids = [
+            rid
+            for rid in re.split(r"[,\s]+", self.retrieve_hass_conf["solcast_rooftop_id"].strip())
+            if rid
+        ]
+        if not roof_ids:
+            self.logger.error(
+                "The solcast_rooftop_id parameter has no usable rooftop IDs "
+                "(empty or separators only)"
+            )
+            return False
+        # Reserve budget for all configured roofs before any HTTP request, so
+        # a reservation that doesn't fit never yields a partial aggregate.
+        if not self._solcast_rate_limit_ok(required_calls=len(roof_ids)):
+            self.logger.warning(
+                "Solcast daily API call limit reached (safety cap). "
+                "Skipping live API call to preserve quota."
+            )
             return False
         headers = {
             "User-Agent": "EMHASS",
@@ -613,7 +729,6 @@ class Forecast:
             "Accept": header_accept,
         }
         days_solcast = int(len(self.forecast_dates) * self.freq.seconds / 3600)
-        roof_ids = re.split(r"[,\s]+", self.retrieve_hass_conf["solcast_rooftop_id"].strip())
         total_data = pd.DataFrame()
 
         # Conservative-bias blend factor, read once before the roof loop.
@@ -640,15 +755,32 @@ class Forecast:
                     if len(data["forecasts"]) == 0:
                         self.logger.error("No data retrieved from Solcast service.")
                         return False
-                    # Build a timestamped DataFrame from Solcast period_end timestamps
-                    solcast_timestamps = [
-                        pd.Timestamp(elm["period_end"]) for elm in data["forecasts"]
-                    ]
+                    # Each Solcast row is an *average* power over the interval
+                    # [period_end - period, period_end); it is not an
+                    # instantaneous sample at period_end. Map those source
+                    # intervals onto the optimisation grid by overlap-weighted
+                    # averaging (see _solcast_overlap_average) so source-period
+                    # energy is preserved for any optimization_time_step -- finer,
+                    # equal or coarser than the source period, and grids that are
+                    # not an exact divisor of it -- without inventing
+                    # interpolation ramps or holding a value across a gap.
+                    solcast_period_ends = pd.DatetimeIndex(
+                        [pd.Timestamp(elm["period_end"]) for elm in data["forecasts"]]
+                    )
+                    if solcast_period_ends.tz is None:
+                        solcast_period_ends = solcast_period_ends.tz_localize("UTC")
+                    solcast_period_ends = solcast_period_ends.tz_convert(self.forecast_dates.tz)
+                    # Respect each row's own `period`; fall back to PT30M only for
+                    # rows that omit it (the pre-existing compatibility default).
+                    solcast_periods = pd.to_timedelta(
+                        [elm.get("period") or "PT30M" for elm in data["forecasts"]]
+                    )
+                    solcast_period_starts = solcast_period_ends - solcast_periods
                     # Blend P50 with P10 according to weather_forecast_pv_quantile_bias.
                     # bias=0 (default) => pure P50 (no-op, identical to previous behaviour).
                     # bias=1 => pure P10 (conservative / low estimate).
                     # If pv_estimate10 is absent for an element, fall back to pv_estimate.
-                    data_list = []
+                    source_power = []
                     for elm in data["forecasts"]:
                         p50 = elm["pv_estimate"]
                         if bias > 0.0:
@@ -659,22 +791,15 @@ class Forecast:
                                 est = p50
                         else:
                             est = p50
-                        data_list.append(est * 1000)
-                    data_tmp = pd.DataFrame(
-                        {"yhat": data_list},
-                        index=pd.DatetimeIndex(solcast_timestamps, name="ts"),
+                        source_power.append(est * 1000)
+                    yhat = _solcast_overlap_average(
+                        solcast_period_starts,
+                        solcast_period_ends,
+                        np.asarray(source_power, dtype="float64"),
+                        self.forecast_dates,
+                        self.freq,
                     )
-                    if data_tmp.index.tz is None:
-                        data_tmp.index = data_tmp.index.tz_localize("UTC")
-                    data_tmp.index = data_tmp.index.tz_convert(self.forecast_dates.tz)
-                    # Reindex to target forecast dates and interpolate
-                    # (handles Solcast 30-min data -> any optimization_time_step)
-                    combined_index = data_tmp.index.union(self.forecast_dates).sort_values()
-                    data_tmp = data_tmp.reindex(combined_index)
-                    data_tmp.interpolate(method="time", inplace=True)
-                    data_tmp = data_tmp.reindex(self.forecast_dates)
-                    # Zero-fill edges beyond Solcast data range
-                    data_tmp = data_tmp.fillna(0.0)
+                    data_tmp = pd.DataFrame({"yhat": yhat}, index=self.forecast_dates)
                     if len(total_data) == 0:
                         total_data = data_tmp.copy()
                     else:
@@ -711,6 +836,7 @@ class Forecast:
             )
         headers = {"Accept": header_accept}
         data = pd.DataFrame()
+        self._check_pv_plant_lists(self._PV_PLANT_LIST_KEYS_SOLAR_FORECAST)
 
         async with aiohttp.ClientSession() as session:
             for i in range(len(self.plant_conf["pv_module_model"])):
@@ -746,7 +872,7 @@ class Forecast:
                     mask_down = data_tmp.copy(deep=True).bfill().isnull()
                     data_tmp.loc[mask_up["yhat"], :] = 0.0
                     data_tmp.loc[mask_down["yhat"], :] = 0.0
-                    data_tmp.interpolate(inplace=True, limit=1)
+                    data_tmp.interpolate(inplace=True, limit_area="inside")
                     data_tmp = data_tmp.fillna(0.0)
                     if len(data) == 0:
                         data = copy.deepcopy(data_tmp)
@@ -770,16 +896,56 @@ class Forecast:
         return data
 
     def _get_weather_list(self) -> pd.DataFrame:
-        """Helper to retrieve weather data from a passed list."""
+        """Helper to retrieve weather data from a passed external PV forecast."""
         data_list = self.params["passed_data"]["pv_power_forecast"]
+        p10_list = self.params["passed_data"].get("pv_power_forecast_p10")
         forecast_dates = self.forecast_dates_tz
+        if data_list is not None and p10_list is not None and len(data_list) != len(p10_list):
+            self.logger.error(
+                "Passed pv_power_forecast/pv_power_forecast_p10 length mismatch: %d/%d",
+                len(data_list),
+                len(p10_list),
+            )
+            return None
         if data_list is None or (
             len(data_list) < len(forecast_dates)
             and self.params["passed_data"]["prediction_horizon"] is None
         ):
             self.logger.error(error_msg_list_not_long_enough)
             return None
+
         data_list = data_list[: len(forecast_dates)]
+
+        # #1128: an explicitly supplied external P10 companion must already
+        # have passed the strict pair validation/alignment in treat_runtimeparams.
+        # Still guard the Forecast boundary so a malformed direct caller cannot
+        # silently ignore or truncate P10. Validate even at bias=0: providing an
+        # invalid companion is an input error, while omitting the companion keeps
+        # the historical P50-only behavior unchanged.
+        if p10_list is not None:
+            if len(p10_list) < len(forecast_dates):
+                self.logger.error(
+                    "Passed pv_power_forecast_p10 is not long enough for the forecast horizon"
+                )
+                return None
+            p10_list = p10_list[: len(forecast_dates)]
+            try:
+                p50_values = np.asarray(data_list, dtype=float)
+                p10_values = np.asarray(p10_list, dtype=float)
+            except (TypeError, ValueError):
+                self.logger.error(
+                    "Passed pv_power_forecast/pv_power_forecast_p10 contain non-numeric values"
+                )
+                return None
+            if not np.isfinite(p50_values).all() or not np.isfinite(p10_values).all():
+                self.logger.error(
+                    "Passed pv_power_forecast/pv_power_forecast_p10 contain non-finite values"
+                )
+                return None
+            bias = self._parse_pv_quantile_bias()
+            if bias > 0.0:
+                data_list = (bias * p10_values + (1.0 - bias) * p50_values).tolist()
+
         data_dict = {"ts": forecast_dates, "yhat": data_list}
         data = pd.DataFrame.from_dict(data_dict)
         data.set_index("ts", inplace=True)
@@ -800,6 +966,10 @@ class Forecast:
             and (
                 isinstance(cfg.get("thermal_config"), dict)
                 or isinstance(cfg.get("thermal_battery"), dict)
+                # heat_topology-compiled loads carry a thermal_source block;
+                # their heating/cooling-curve COP and solar-gain physics need
+                # ghi/temp_air just the same.
+                or isinstance(cfg.get("thermal_source"), dict)
             )
             for cfg in self.optim_conf.get("def_load_config", []) or []
         )
@@ -870,16 +1040,24 @@ class Forecast:
                 "The scrapper method has been deprecated and the keyword is accepted just for backward compatibility, please change the PV forecast method to open-meteo"
             )
         self.weather_forecast_method = method
-        # The P50/P10 quantile-bias blend is only available from Solcast, the
-        # only provider that returns pv_estimate10. If the knob is set for any
-        # other method, warn and ignore it so the Solcast dependency is explicit
-        # rather than a silent no-op. (Short-circuits before parsing for solcast,
-        # so this never double-logs with the parse inside _get_weather_solcast.)
-        if method != "solcast" and self._parse_pv_quantile_bias() > 0.0:
+        # The quantile-bias blend is supported by native Solcast and by the
+        # caller-supplied list path when a P10 companion is present (#1128).
+        # Other methods, including a P50-only list, retain a visible warning
+        # rather than silently accepting a bias that cannot be applied.
+        list_has_external_p10 = (
+            method == "list"
+            and self.params.get("passed_data", {}).get("pv_power_forecast_p10") is not None
+        )
+        if (
+            method != "solcast"
+            and not list_has_external_p10
+            and self._parse_pv_quantile_bias() > 0.0
+        ):
             self.logger.warning(
                 "weather_forecast_pv_quantile_bias is set but only applies to the "
-                "'solcast' weather_forecast_method (the only provider returning P10 "
-                "quantiles); ignoring it for weather_forecast_method=%r.",
+                "'solcast' weather_forecast_method or to 'list' when "
+                "pv_power_forecast_p10 is supplied; ignoring it for "
+                "weather_forecast_method=%r.",
                 method,
             )
         if method in ["open-meteo", "scrapper"]:
@@ -906,14 +1084,48 @@ class Forecast:
         self.logger.debug("get_weather_forecast returning:\n%s", data)
         return data
 
+    @staticmethod
+    def _covariate_cache_covers(data: dict, past_days: int, forecast_days: int) -> bool:
+        """Return True when a cached Open-Meteo response covers the requested span.
+
+        Open-Meteo truncates ``past_days``/``forecast_days`` windows to local midnight, so
+        the bounds derived from the requested span are given ±1 day of tolerance at each
+        boundary: the goal is to catch serving a future-only MPC cache (≈1 past day) to a
+        fit that requested 58 past days, not to enforce exact window boundaries.
+        """
+        times = (data.get("minutely_15") or {}).get("time")
+        if not times:
+            return False
+        now = datetime.now().timestamp()
+        day = 86400
+        req_start = now - max(past_days - 1, 0) * day
+        req_end = now + max(forecast_days - 1, 0) * day
+        return times[0] <= req_start + day and times[-1] >= req_end - day
+
+    @staticmethod
+    def _covariate_cache_matches_location(data: dict, lat: float, lon: float) -> bool:
+        """Return True when a cached Open-Meteo response matches the configured site.
+
+        Responses carry the coordinates Open-Meteo resolved for the request, which differ
+        from the requested ones by up to the model-grid resolution, so the comparison
+        allows a small tolerance. A cache without coordinates cannot be validated and is
+        accepted.
+        """
+        cached_lat = data.get("latitude")
+        cached_lon = data.get("longitude")
+        if cached_lat is None or cached_lon is None:
+            return True
+        tolerance = 0.1  # ~11 km: absorbs grid resolution, still catches a real site change
+        return abs(cached_lat - lat) <= tolerance and abs(cached_lon - lon) <= tolerance
+
     async def _fetch_open_meteo_covariates_json(self, past_days: int, forecast_days: int) -> dict:
         """Fetch (and cache) an Open-Meteo ``minutely_15`` response spanning past + future days.
 
         This is kept separate from :meth:`get_cached_open_meteo_forecast_json` (which serves the PV
         path and is future-only) so the weather-covariate feature is fully self-contained and the
         existing weather/PV behaviour is untouched. The cache is reused until it is older than the
-        configured ``open_meteo_cache_max_age`` and, as with the PV cache, a stale cache is still
-        returned as a fallback if a fresh fetch fails.
+        configured ``open_meteo_cache_max_age`` and, as with the PV cache, a stale cache that
+        still covers the requested span is returned as a fallback if a fresh fetch fails.
         """
         cache_path = os.path.abspath(
             self.emhass_conf["data_path"] / "cached-open-meteo-covariates.json"
@@ -931,6 +1143,28 @@ class Forecast:
             except (orjson.JSONDecodeError, OSError):
                 # A corrupted/truncated cache must not block the fallback fetch: treat it as a miss.
                 self.logger.warning("Open-Meteo covariate cache is unreadable; refetching")
+                data = None
+                use_cache = False
+            if data is not None and not self._covariate_cache_covers(
+                data, past_days, forecast_days
+            ):
+                self.logger.warning(
+                    "Cached covariate data does not cover the requested span (past_days=%s, "
+                    "forecast_days=%s); refetching a fresh response",
+                    past_days,
+                    forecast_days,
+                )
+                # Drop it as the fetch-failure fallback too: gap-filled near-constant covariates
+                # are worse for callers that train models on them than failing the request.
+                data = None
+                use_cache = False
+            if data is not None and not self._covariate_cache_matches_location(
+                data, self.lat, self.lon
+            ):
+                self.logger.warning(
+                    "Cached covariate data is for a different location than the configured "
+                    "site; refetching a fresh response"
+                )
                 data = None
                 use_cache = False
         if not use_cache:
@@ -1069,8 +1303,14 @@ class Forecast:
         beta: float,
         col: str,
         ignore_pv_feedback: bool = False,
+        logger: logging.Logger | None = None,
+        configured_col: str | None = None,
     ) -> pd.DataFrame:
         """A simple correction method for forecasted data using the current real values of a variable.
+
+        If either blend operand (the first forecast value or the latest live
+        value) is NaN, the correction is skipped and the forecast is returned
+        unchanged (issue #1084).
 
         :param df_now: The DataFrame containing the current/real values
         :type df_now: pd.DataFrame
@@ -1084,7 +1324,19 @@ class Forecast:
         :type col: str
         :param ignore_pv_feedback: If True, bypass mixing and return original forecast (used during curtailment)
         :type ignore_pv_feedback: bool
-        :return: The output DataFrame with the corrected values
+        :param logger: Optional logger used to warn when a blend operand is NaN. \
+            If either the first forecast value or the latest live/current value \
+            for ``col`` is NaN, the blend is skipped and ``df_forecast`` is \
+            returned unchanged; a warning naming the NaN operand(s) and ``col`` \
+            is only emitted when a logger is supplied, defaults to None
+        :type logger: logging.Logger, optional
+        :param configured_col: The user-configured sensor name behind ``col`` \
+            when the two differ (the load column is renamed internally to \
+            ``var_load + "_positive"``). Only used to label the NaN warning \
+            with the name the user would recognize, defaults to None
+        :type configured_col: str, optional
+        :return: The output DataFrame with the corrected values, or unchanged \
+            when the correction was skipped
         :rtype: pd.DataFrame
         """
         # If ignoring PV feedback (e.g., during curtailment), return original forecast
@@ -1099,7 +1351,45 @@ class Forecast:
         if df_now is None or col not in df_now.columns or df_now.empty:
             return df_forecast
 
-        first_fcst = alpha * df_forecast.iloc[0] + beta * df_now[col].iloc[-1]
+        forecast_operand = df_forecast.iloc[0]
+        live_operand = df_now[col].iloc[-1]
+        forecast_is_nan = pd.isna(forecast_operand)
+        live_is_nan = pd.isna(live_operand)
+        # Issue #1084: either blend operand can be NaN (e.g. a forecast provider
+        # gap, or no fresh live sensor reading yet). Blending a NaN eventually
+        # hits `int(round(nan))`, which raises `ValueError: cannot convert float
+        # NaN to integer` and crashes the whole optimization call. Skip the
+        # blend and return the forecast unchanged instead. Note: a NaN live
+        # operand (the case diagnosed in #1084) is fully recovered from; a NaN
+        # in the forecast series itself is still fatal further down the
+        # pipeline (nothing repairs it), but this warning names the cause at
+        # its source.
+        if forecast_is_nan or live_is_nan:
+            if logger:
+                nan_operands = []
+                if forecast_is_nan:
+                    nan_operands.append("the first forecast value")
+                if live_is_nan:
+                    nan_operands.append("the latest live sensor value")
+                # The load column is renamed internally to var_load + "_positive";
+                # the caller passes the configured name alongside so users can
+                # find the sensor. Columns passed under their configured name
+                # (e.g. PV) are shown as-is, even if the name ends in "_positive".
+                col_label = (
+                    f"{col} (configured as '{configured_col}')"
+                    if configured_col and configured_col != col
+                    else col
+                )
+                verb = "are" if len(nan_operands) == 2 else "is"
+                logger.warning(
+                    f"get_mix_forecast: {' and '.join(nan_operands)} for column "
+                    f"'{col_label}' {verb} NaN; skipping the mix-forecast blend and "
+                    "returning the forecast unchanged. Check the input data for "
+                    "gaps or unrepaired values."
+                )
+            return df_forecast
+
+        first_fcst = alpha * forecast_operand + beta * live_operand
         df_forecast.iloc[0] = int(round(first_fcst))
         return df_forecast
 
@@ -1165,10 +1455,58 @@ class Forecast:
             self.logger.error(f"Invalid type for {device_type} model: {type(model_spec)}")
             return None
 
+    # The plant_conf lists each forecast path reads per PV plant (indexed by the
+    # position of the plant in pv_module_model) when pv_module_model is a list.
+    _PV_PLANT_LIST_KEYS_PVLIB = (
+        "pv_inverter_model",
+        "surface_tilt",
+        "surface_azimuth",
+        "modules_per_string",
+        "strings_per_inverter",
+    )
+    _PV_PLANT_LIST_KEYS_SOLAR_FORECAST = ("surface_tilt", "surface_azimuth")
+
+    def _check_pv_plant_lists(self, keys: tuple[str, ...]) -> None:
+        """
+        Check the sibling PV plant lists against ``pv_module_model``.
+
+        Each entry of ``pv_module_model`` is one PV plant and every key in ``keys`` is read
+        per plant by position, so each of them has to be a list with at least one entry per
+        plant. A shorter list, or a single value where a list is expected, raises a
+        ValueError naming the parameter and the expected count. A longer list is accepted
+        with a warning, since only the first entries are read. Nothing is checked when
+        ``pv_module_model`` is not a list.
+
+        :param keys: The plant_conf keys the calling forecast path reads per plant
+        :type keys: tuple[str, ...]
+        """
+        models = self.plant_conf.get("pv_module_model")
+        if not isinstance(models, list):
+            return
+        n_plants = len(models)
+        for key in keys:
+            value = self.plant_conf.get(key)
+            if not isinstance(value, list):
+                raise ValueError(
+                    f"{key} must be a list with one entry per PV plant when pv_module_model "
+                    f"is a list ({n_plants} plants), got {type(value).__name__}"
+                )
+            if len(value) < n_plants:
+                raise ValueError(
+                    f"{key} has {len(value)} entries but pv_module_model has {n_plants}: "
+                    "each PV plant needs its own value"
+                )
+            if len(value) > n_plants:
+                self.logger.warning(
+                    f"{key} has {len(value)} entries but pv_module_model has {n_plants}; "
+                    "the extra entries are ignored"
+                )
+
     def _calculate_pvlib_power(self, df_weather: pd.DataFrame) -> pd.Series:
         """
         Helper to simulate PV power generation using PVLib when no direct forecast is available.
         """
+        self._check_pv_plant_lists(self._PV_PLANT_LIST_KEYS_PVLIB)
         # Setting the main parameters of the PV plant
         location = Location(latitude=self.lat, longitude=self.lon)
         temp_params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["close_mount_glass_glass"]
@@ -1269,6 +1607,7 @@ class Forecast:
                 self.params["passed_data"]["beta"],
                 self.var_pv,
                 ignore_pv_feedback,
+                logger=self.logger,
             )
         p_pv_forecast[p_pv_forecast < 0] = 0  # replace any negative PV values with zero
         self.logger.debug("get_power_from_weather returning:\n%s", p_pv_forecast)
@@ -1323,7 +1662,8 @@ class Forecast:
 
         This method aligns the actual PV production data with the forecasted data,
         adds additional features for analysis, and separates the predictors (X)
-        from the target variable (y).
+        from the target variable (y). It utilizes all available valid data
+        to maximize production accuracy.
 
         :param data: A DataFrame containing the actual PV production data and the
             forecasted PV production data.
@@ -1343,22 +1683,11 @@ class Forecast:
             data.to_csv(
                 self.emhass_conf["data_path"] / "debug-adjust-pv-forecast-data-prep-input-data.csv"
             )
+
         P_PV = data[self.var_pv]  # Actual PV production
         p_pv_forecast = data[self.var_pv_forecast]  # Forecasted PV production
-        # Define time ranges
-        last_day = data.index.max().normalize()  # Last available day
-        three_months_ago = last_day - pd.DateOffset(
-            days=self.retrieve_hass_conf["historic_days_to_retrieve"]
-        )
-        # Train/Test: Last historic_days_to_retrieve days (excluding the last day)
-        train_test_mask = (data.index >= three_months_ago) & (data.index < last_day)
-        self.p_pv_train_test = P_PV[train_test_mask]
-        self.p_pv_forecast_train_test = p_pv_forecast[train_test_mask]
-        # Validation: Last day only
-        validation_mask = data.index >= last_day
-        self.p_pv_validation = P_PV[validation_mask]
-        self.p_pv_forecast_validation = p_pv_forecast[validation_mask]
-        # Ensure data is aligned
+
+        # Ensure data is aligned using the full dataset
         self.data_adjust_pv = pd.concat(
             [P_PV.rename("actual"), p_pv_forecast.rename("forecast")], axis=1
         ).dropna()
@@ -1392,14 +1721,18 @@ class Forecast:
         self.data_adjust_pv = Forecast.add_cyclic_hour_features(self.data_adjust_pv)
 
         self.data_adjust_pv = Forecast.compute_solar_angles(self.data_adjust_pv, self.lat, self.lon)
+
         # Features (X) and target (y)
         self.x_adjust_pv = self.data_adjust_pv.drop(columns=["actual"])  # Predictors
         self.y_adjust_pv = self.data_adjust_pv["actual"]  # Target: actual PV production
+
         self.logger.debug("adjust_pv_forecast_data_prep output data:\n%s", self.data_adjust_pv)
         if self.logger.isEnabledFor(logging.DEBUG):
             self.data_adjust_pv.to_csv(
                 self.emhass_conf["data_path"] / "debug-adjust-pv-forecast-data-prep-output-data.csv"
             )
+
+        return self.data_adjust_pv
 
     async def adjust_pv_forecast_fit(
         self,
@@ -1439,20 +1772,32 @@ class Forecast:
             self.logger,
         )
         pipeline, param_grid = mlr._get_model_and_params()
+
         # Time-series split
         tscv = TimeSeriesSplit(n_splits=n_splits)
         grid_search = GridSearchCV(
             pipeline, param_grid, cv=tscv, scoring="neg_mean_squared_error", verbose=0
         )
+
         # Train model
         await asyncio.to_thread(grid_search.fit, self.x_adjust_pv, self.y_adjust_pv)
         self.model_adjust_pv = grid_search.best_estimator_
-        # Calculate training metrics
+
+        # Calculate and log Time-Series Cross-Validation metrics
+        if hasattr(grid_search, "best_score_"):
+            cv_rmse = np.sqrt(-grid_search.best_score_)
+            self.logger.info(f"PV adjust Time-Series CV RMSE: {cv_rmse:.2f}")
+
+        # Calculate in-sample training metrics for legacy monitoring
         y_pred_train = self.model_adjust_pv.predict(self.x_adjust_pv)
         self.rmse = np.sqrt(mean_squared_error(self.y_adjust_pv, y_pred_train))
         self.r2 = r2_score(self.y_adjust_pv, y_pred_train)
-        # Log the metrics
-        self.logger.info(f"PV adjust Training metrics: RMSE = {self.rmse}, R2 = {self.r2}")
+
+        # Log the in-sample metrics
+        self.logger.info(
+            f"PV adjust Training metrics (in-sample): RMSE = {self.rmse}, R2 = {self.r2}"
+        )
+
         # Save model
         if not debug:
             filename = "adjust_pv_regressor.pkl"
@@ -1460,32 +1805,28 @@ class Forecast:
             async with aiofiles.open(filename_path, "wb") as outp:
                 await outp.write(pickle.dumps(self.model_adjust_pv, pickle.HIGHEST_PROTOCOL))
 
-    def adjust_pv_forecast_predict(self, forecasted_pv: pd.DataFrame | None = None) -> pd.DataFrame:
+    def adjust_pv_forecast_predict(self, forecasted_pv: pd.DataFrame) -> pd.DataFrame:
         """
         Predict the adjusted photovoltaic (PV) forecast.
 
         This method uses the trained regression model to predict the adjusted PV forecast
-        based on either the validation data stored in `self` or a new forecasted PV data
-        passed as input. It applies additional features such as date and solar angles to
-        the forecasted PV production data before making predictions. The solar elevation
-        is used to avoid negative values and to fix values at the beginning and end of the day.
+        based on new forecasted PV data passed as input. It applies additional features
+        such as date and solar angles to the forecasted PV production data before making
+        predictions. The solar elevation is used to avoid negative values and to fix
+        values at the beginning and end of the day.
 
-        :param forecasted_pv: Optional. A DataFrame containing the forecasted PV production data.
+        :param forecasted_pv: A DataFrame containing the forecasted PV production data.
                             It must have a DateTime index and a column named "forecast".
-                            If not provided, the method will use `self.p_pv_forecast_validation`.
-        :type forecasted_pv: pd.DataFrame, optional
+        :type forecasted_pv: pd.DataFrame
         :return: A DataFrame containing the adjusted PV forecast with additional features.
         :rtype: pd.DataFrame
         """
-        # Use the provided forecasted PV data or fall back to the validation data in `self`
-        if forecasted_pv is not None:
-            # Ensure the input DataFrame has the required structure
-            if "forecast" not in forecasted_pv.columns:
-                raise ValueError("The input DataFrame must contain a 'forecast' column.")
-            forecast_data = forecasted_pv.copy()
-        else:
-            # Use the validation data stored in `self`
-            forecast_data = self.p_pv_forecast_validation.rename("forecast").to_frame()
+        # Ensure the input DataFrame has the required structure
+        if "forecast" not in forecasted_pv.columns:
+            raise ValueError("The input DataFrame must contain a 'forecast' column.")
+
+        forecast_data = forecasted_pv.copy()
+
         # Prepare the forecasted PV data (same feature set as the fit side:
         # calendar features without the raw hour, plus the cyclic hour encoding)
         forecast_data = add_date_features(
@@ -1494,6 +1835,7 @@ class Forecast:
         )
         forecast_data = Forecast.add_cyclic_hour_features(forecast_data)
         forecast_data = Forecast.compute_solar_angles(forecast_data, self.lat, self.lon)
+
         # Predict the adjusted forecast
         forecast_data["adjusted_forecast"] = self.model_adjust_pv.predict(forecast_data)
 
@@ -1516,31 +1858,27 @@ class Forecast:
                 return row["adjusted_forecast"]
 
         forecast_data["adjusted_forecast"] = forecast_data.apply(apply_weighting, axis=1)
+
         # Clamp to non-negative: PV power is physically >= 0, but the daytime branch
         # above returns the raw regression output (e.g. Lasso is unconstrained and can
         # extrapolate below zero on cloudy days after sunny training history). See #521.
         forecast_data["adjusted_forecast"] = forecast_data["adjusted_forecast"].clip(lower=0)
-        # If using validation data, calculate validation metrics
-        if forecasted_pv is None:
-            y_true = self.p_pv_validation.values
-            y_pred = forecast_data["adjusted_forecast"].values
-            self.validation_rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-            self.validation_r2 = r2_score(y_true, y_pred)
-            # Log the validation metrics
-            self.logger.info(
-                f"PV adjust Validation metrics: RMSE = {self.validation_rmse}, R2 = {self.validation_r2}"
-            )
+
         self.logger.debug("adjust_pv_forecast_predict forecast data:\n%s", forecast_data)
         if self.logger.isEnabledFor(logging.DEBUG):
             forecast_data.to_csv(
                 self.emhass_conf["data_path"] / "debug-adjust-pv-forecast-predict-forecast-data.csv"
             )
+
         # Return the DataFrame with the adjusted forecast
         return forecast_data
 
     def get_forecast_days_csv(self, timedelta_days: int | None = 1) -> pd.date_range:
         r"""
         Get the date range vector of forecast dates that will be used when loading a CSV file.
+
+        The configured forecast horizon and any CSV extension are local calendar-day
+        counts resolved once from the frozen forecast start.
 
         :return: The forecast dates vector
         :rtype: pd.date_range
@@ -1551,14 +1889,18 @@ class Forecast:
         # lands the other side of a rounding boundary builds a grid one step off
         # from the one df_final is indexed on, and the strict lookup in
         # _extract_daily_forecast then raises KeyError (issue #1076). The
-        # rounding itself still happens exactly once, in __init__.
+        # start itself is rounded once per request (get_forecast_start), by
+        # treat_runtimeparams or, without it, in __init__.
         start_forecast_csv = self.start_forecast
-        end_forecast_csv = (
-            start_forecast_csv + pd.DateOffset(days=self.optim_conf["delta_forecast_daily"].days)
-        ).replace(microsecond=0)
+        total_days = self.optim_conf["delta_forecast_daily"].days + int(timedelta_days or 0)
+        end_forecast_csv = add_local_calendar_days(
+            start_forecast_csv,
+            total_days,
+            self.time_zone,
+        )
         forecast_dates_csv = pd.date_range(
             start=start_forecast_csv,
-            end=end_forecast_csv + timedelta(days=timedelta_days) - self.freq,
+            end=end_forecast_csv - self.freq,
             freq=self.freq,
             tz=self.time_zone,
         )
@@ -1586,21 +1928,22 @@ class Forecast:
             df_csv = pd.DataFrame.from_dict(data_dict)
             df_csv.index = forecast_dates_csv
             df_csv = df_csv.drop(["ts"], axis=1)
-            df_csv = set_df_index_freq(df_csv)
         else:
             if not os.path.exists(csv_path):
                 csv_path = self.emhass_conf["data_path"] / csv_path
             df_csv = pd.read_csv(csv_path, header=None, names=["ts", "yhat"])
             # Check if first column is a valid datetime
             first_col = df_csv.iloc[:, 0]
-            if pd.to_datetime(first_col, errors="coerce").notna().all():
+            # utc=True so local ISO timestamps spanning a DST change (two UTC offsets) are
+            # recognised, consistent with the parse below.
+            if pd.to_datetime(first_col, errors="coerce", utc=True).notna().all():
                 df_csv["ts"] = pd.to_datetime(df_csv["ts"], utc=True)
                 df_csv.set_index("ts", inplace=True)
                 df_csv.index = df_csv.index.tz_convert(self.time_zone)
             else:
                 df_csv.index = forecast_dates_csv
                 df_csv = df_csv.drop(["ts"], axis=1)
-            df_csv = set_df_index_freq(df_csv)
+        df_csv = set_df_index_freq(df_csv)
         return df_csv
 
     def _extract_daily_forecast(
@@ -1625,29 +1968,40 @@ class Forecast:
             end=df_timing.index[last_elm_index],
             freq=df_timing.index.freq,
         )
-        first_hour = f"{df_timing.index[first_elm_index].hour:02d}:{df_timing.index[first_elm_index].minute:02d}"
-        last_hour = f"{df_timing.index[last_elm_index].hour:02d}:{df_timing.index[last_elm_index].minute:02d}"
         # Extract data
-        if csv_path is None:
-            if list_and_perfect:
-                values_array = df_csv.between_time(first_hour, last_hour).values
-                # Adjust index length if necessary
-                fcst_index = fcst_index[0 : len(values_array)]
-                return pd.DataFrame(values_array, index=fcst_index)
-            else:
-                return pd.DataFrame(
-                    df_csv.loc[fcst_index, :].between_time(first_hour, last_hour).values,
-                    index=fcst_index,
+        if csv_path is None and list_and_perfect:
+            # Perfect optimization applies one daily profile to every historical day by
+            # time of day, so selection by wall-clock time is intentional here. Each target
+            # step takes the profile value of its own wall time (both passes of a repeated
+            # hour share it, a skipped hour has no step); steps the profile does not cover
+            # are left out and filled from the nearest step by the merge below.
+            minute_of_day = df_csv.index.hour * 60 + df_csv.index.minute
+            profile = df_csv[~minute_of_day.duplicated()]
+            profile = profile.set_axis(minute_of_day[~minute_of_day.duplicated()])
+            wall_times = fcst_index.hour * 60 + fcst_index.minute
+            covered = wall_times.isin(profile.index)
+            if not covered.all():
+                self.logger.debug(
+                    "%d step(s) have no profile value at their wall time; the nearest one is used",
+                    int((~covered).sum()),
                 )
-        else:
-            # For CSV path, filter by date string first
-            df_csv_filtered_date = df_csv.loc[
-                df_csv.index.strftime("%Y-%m-%d") == fcst_index[0].date().strftime("%Y-%m-%d")
-            ]
-            return pd.DataFrame(
-                df_csv_filtered_date.between_time(first_hour, last_hour).values,
-                index=fcst_index,
-            )
+            return pd.DataFrame(profile.loc[wall_times[covered]].values, index=fcst_index[covered])
+        # Otherwise every target instant is looked up exactly, by UTC instant. A wall-clock
+        # filter (between_time) would drop or double the repeated hour of a fall-back day.
+        return pd.DataFrame(self._values_at_instants(df_csv, fcst_index), index=fcst_index)
+
+    @staticmethod
+    def _values_at_instants(df: pd.DataFrame, instants: pd.DatetimeIndex) -> np.ndarray:
+        """Return ``df`` values at ``instants``, matching on the absolute UTC instant.
+
+        The lookup is strict: a missing instant raises ``KeyError``. Matching on UTC keeps
+        both occurrences of a repeated local time distinct and does not depend on whether the
+        two indexes carry pytz or zoneinfo time zones.
+        """
+        if df.index.tz is None or instants.tz is None:
+            return df.loc[instants, :].values
+        by_utc = df.set_axis(df.index.tz_convert("UTC"))
+        return by_utc.loc[instants.tz_convert("UTC"), :].values
 
     def get_forecast_out_from_csv_or_list(
         self,
@@ -1658,11 +2012,13 @@ class Forecast:
         list_and_perfect: bool | None = False,
     ) -> pd.DataFrame:
         r"""
-        Get the forecast data as a DataFrame from a CSV file.
+        Get the forecast data as a DataFrame from a CSV file or a list.
 
-        The data contained in the CSV file should be a 24h forecast with the same frequency as
-        the main 'optimization_time_step' parameter in the configuration file. The timestamp will not be used and
-        a new DateTimeIndex is generated to fit the timestamp index of the input data in 'df_final'.
+        The CSV file has no header. If every first-column value parses as a timestamp (a value
+        without a UTC offset is read as UTC), the rows are matched to the grid by UTC instant;
+        otherwise the values are assigned positionally to ``forecast_dates_csv``. A step more
+        than one source step beyond the span of the source takes the closest row and logs a
+        warning.
 
         :param df_final: The DataFrame containing the input data.
         :type df_final: pd.DataFrame
@@ -1696,7 +2052,33 @@ class Forecast:
         else:
             forecast_out = pd.DataFrame()
         if not forecast_out.empty and forecast_out.index.dtype != df_final.index.dtype:
-            forecast_out.index = forecast_out.index.astype(df_final.index.dtype)
+            if forecast_out.index.tz is not None and df_final.index.tz is not None:
+                # Same instants, expressed in df_final's zone. astype() with a zone name can
+                # swap a pytz index for a zoneinfo one (pandas 3) and break label lookups.
+                forecast_out.index = forecast_out.index.tz_convert(df_final.index.tz).as_unit(
+                    df_final.index.unit
+                )
+            else:
+                forecast_out.index = forecast_out.index.astype(df_final.index.dtype)
+        if len(forecast_out) > 1 and len(df_final):
+            # A source coarser than the step, or a few minutes off the grid, is held/matched
+            # by merge_asof(nearest) as intended. Only steps beyond the source's span (plus
+            # one source step) are a coverage gap worth a warning.
+            source_step = forecast_out.index.to_series().diff().median()
+            uncovered = (df_final.index < forecast_out.index.min() - source_step) | (
+                df_final.index > forecast_out.index.max() + source_step
+            )
+            if uncovered.any():
+                # merge_asof(nearest) below still fills these steps from the closest source
+                # row (the established hold behaviour); make that visible instead of silent.
+                self.logger.warning(
+                    "The forecast source does not cover %d of %d time steps (%s to %s); "
+                    "the nearest available value is used for them.",
+                    int(uncovered.sum()),
+                    len(df_final),
+                    df_final.index[uncovered][0],
+                    df_final.index[uncovered][-1],
+                )
         # Merge with final DataFrame to align indices
         merged = pd.merge_asof(
             df_final.sort_index(),
@@ -1775,6 +2157,73 @@ class Forecast:
         # Compute the mean load for each timestamp
         forecast = combined_data.groupby(combined_data.index).mean()
         return forecast, used_days
+
+    @staticmethod
+    def get_naive_load_forecast(
+        history: pd.Series,
+        forecast_dates: pd.DatetimeIndex,
+        tolerance: pd.Timedelta = pd.Timedelta(0),
+        logger: logging.Logger | None = None,
+    ) -> pd.Series:
+        r"""
+        Naive 1-day persistence: forecast each step with the load seen at the same time of day.
+
+        The value for a forecast timestamp ``t`` is the observation at the same local
+        wall-clock time ``n`` calendar days earlier, ``n >= 1`` being the smallest
+        number of days for which that time is already in the history. Any horizon
+        (shorter or longer than one day) thus repeats the most recent day of history
+        aligned on the time of day. When the forecast starts right after the last
+        observation and spans one day, this is the plain "last 24 h carried forward".
+
+        Calendar days are used, like ``delta_forecast_daily``, so across a DST change
+        07:00 is still forecast from 07:00. A wall-clock time that is missing on that
+        day (a gap in the history, or a time that did not exist or occurred twice
+        because of a DST change) is taken from the day before instead. If no earlier
+        day has it either (history too short), the observation nearest to
+        ``t - n * 24h`` is used and a warning is logged, so no NaN is returned.
+
+        :param history: Observed load with a tz-aware DatetimeIndex, oldest first.
+        :type history: pd.Series
+        :param forecast_dates: The tz-aware timestamps to forecast.
+        :type forecast_dates: pd.DatetimeIndex
+        :param tolerance: Maximum distance between a wanted past timestamp and the \
+            history sample used for it, defaults to 0 (exact match only).
+        :type tolerance: pd.Timedelta, optional
+        :param logger: Optional logger for the history-too-short warning.
+        :type logger: logging.Logger, optional
+        :return: The forecast values indexed by ``forecast_dates``.
+        :rtype: pd.Series
+        """
+        history = history.dropna()
+        one_day = pd.Timedelta(days=1)
+        tz = forecast_dates.tz
+        wall_clock = forecast_dates.tz_localize(None)
+        last_wall_clock = history.index[-1].tz_convert(tz).tz_localize(None)
+        days_back = np.maximum(1, np.ceil((wall_clock - last_wall_clock) / one_day))
+        first_wall_clock = history.index[0].tz_convert(tz).tz_localize(None)
+        # Calendar days covered, not 24 h spans: a spring-forward day lasts 23 h.
+        history_days = (last_wall_clock.normalize() - first_wall_clock.normalize()).days + 1
+        yhat = np.full(len(forecast_dates), np.nan)
+        for extra_days in range(history_days + 1):
+            source = (wall_clock - pd.to_timedelta(days_back + extra_days, unit="D")).tz_localize(
+                tz, ambiguous="NaT", nonexistent="NaT"
+            )
+            values = history.reindex(source, method="nearest", tolerance=tolerance).to_numpy()
+            yhat = np.where(np.isnan(yhat), values, yhat)
+            if not np.isnan(yhat).any():
+                break
+        missing = np.isnan(yhat)
+        if missing.any():
+            if logger:
+                logger.warning(
+                    f"Naive load forecast: no same-time-of-day history for {missing.sum()} of "
+                    f"{len(yhat)} forecast steps, using the nearest available observation."
+                )
+            nearest = history.reindex(
+                forecast_dates - pd.to_timedelta(days_back, unit="D"), method="nearest"
+            )
+            yhat[missing] = nearest.to_numpy()[missing]
+        return pd.Series(yhat, index=forecast_dates)
 
     async def _prepare_hass_load_data(
         self, days_min_load_forecast: int, method: str
@@ -1914,10 +2363,11 @@ class Forecast:
         return forecast_out.rename(columns={"load": "yhat"})
 
     def _get_load_forecast_naive(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Helper for naive forecast."""
-        forecast_horizon = len(self.forecast_dates)
-        historical_values = df.iloc[-forecast_horizon:]
-        return pd.DataFrame(historical_values.values, index=self.forecast_dates, columns=["yhat"])
+        """Helper for naive forecast, see ``get_naive_load_forecast``."""
+        yhat = Forecast.get_naive_load_forecast(
+            df.iloc[:, 0], self.forecast_dates, tolerance=self.freq / 2, logger=self.logger
+        )
+        return yhat.to_frame(name="yhat")
 
     async def _build_weather_future(
         self, data_last_window: pd.DataFrame, mlf
@@ -2193,6 +2643,10 @@ class Forecast:
         # Post-processing (Mix Forecast)
         p_load_forecast = copy.deepcopy(forecast_out["yhat"])
         if set_mix_forecast:
+            # +/-Inf or a non-numeric first value would crash the blend's
+            # round() before the final load check below can report it (#1135).
+            if self._reject_invalid_load(p_load_forecast):
+                return False
             # Load forecasts don't need curtailment protection - always use feedback
             p_load_forecast = Forecast.get_mix_forecast(
                 df_now,
@@ -2201,9 +2655,36 @@ class Forecast:
                 self.params["passed_data"]["beta"],
                 self.var_load_new,
                 False,  # Never ignore feedback for load forecasts
+                logger=self.logger,
+                configured_col=self.var_load,
             )
+        # Optimizer-facing load contract (#1135), enforced once for every method
+        # and after mixing: P_Load must be finite and >= 0 W. Household
+        # consumption cannot be negative, so a finite negative value (e.g. an
+        # unconstrained regression excursion) is clipped like negative PV;
+        # a non-finite value cannot be repaired and fails the cycle.
+        if self._reject_invalid_load(p_load_forecast):
+            return False
+        negative = p_load_forecast < 0
+        if negative.any():
+            self.logger.warning(
+                "Load forecast contained %d negative value(s); minimum=%g W, first at %s. "
+                "Values were clipped to 0 W before optimization.",
+                int(negative.sum()),
+                p_load_forecast.min(),
+                negative.idxmax(),
+            )
+            p_load_forecast = p_load_forecast.clip(lower=0)
         self.logger.debug("get_load_forecast returning:\n%s", p_load_forecast)
         return p_load_forecast
+
+    def _reject_invalid_load(self, p_load_forecast: pd.Series) -> bool:
+        """Log and return True if the load forecast holds a value that is not a finite real number."""
+        invalid = describe_invalid_forecast_value("P_Load", p_load_forecast.items())
+        if invalid is None:
+            return False
+        self.logger.error("Load forecast rejected before optimization: %s", invalid)
+        return True
 
     def get_load_cost_forecast(
         self,
@@ -2235,18 +2716,24 @@ class Forecast:
             df_final.index = df_final.index.astype("datetime64[ns, " + str(self.time_zone) + "]")
         csv_path = self.emhass_conf["data_path"] / csv_path
         if method == "hp_hc_periods":
+            # The peak periods are wall-clock times on the tariff schedule clock:
+            # the site time zone unless tariff_schedule_time_zone says otherwise.
+            schedule_tz_name = str(self.optim_conf.get("tariff_schedule_time_zone") or "").strip()
+            try:
+                schedule_tz = pytz.timezone(schedule_tz_name) if schedule_tz_name else None
+            except pytz.UnknownTimeZoneError:
+                self.logger.error(error_msg_tariff_schedule_time_zone, schedule_tz_name)
+                return False
             df_final[self.var_load_cost] = self.optim_conf["load_offpeak_hours_cost"]
-            list_df_hp = []
+            # Same instants re-expressed on the schedule clock. This is only a view
+            # for the wall-clock membership test; df_final keeps its site-time index.
+            schedule_index = df_final.index.tz_convert(schedule_tz or self.time_zone)
+            is_peak = np.zeros(len(df_final), dtype=bool)
             for _key, period_hp in self.optim_conf["load_peak_hour_periods"].items():
-                list_df_hp.append(
-                    df_final[self.var_load_cost].between_time(
-                        period_hp[0]["start"], period_hp[1]["end"]
-                    )
-                )
-            for df_hp in list_df_hp:
-                df_final.loc[df_hp.index, self.var_load_cost] = self.optim_conf[
-                    "load_peak_hours_cost"
-                ]
+                is_peak[
+                    schedule_index.indexer_between_time(period_hp[0]["start"], period_hp[1]["end"])
+                ] = True
+            df_final.loc[is_peak, self.var_load_cost] = self.optim_conf["load_peak_hours_cost"]
         elif method == "csv":
             forecast_dates_csv = self.get_forecast_days_csv(timedelta_days=0)
             forecast_out = self.get_forecast_out_from_csv_or_list(
@@ -2263,8 +2750,9 @@ class Forecast:
         elif method == "list":  # reading a list of values
             # Loading data from passed list
             data_list = self.params["passed_data"]["load_cost_forecast"]
-            # Check if the passed data has the correct length
-            if (
+            # Check if the passed data has the correct length. None means the
+            # runtime value was rejected (#1135): fail rather than crash.
+            if data_list is None or (
                 len(data_list) < len(self.forecast_dates)
                 and self.params["passed_data"]["prediction_horizon"] is None
             ):
@@ -2340,8 +2828,9 @@ class Forecast:
         elif method == "list":  # reading a list of values
             # Loading data from passed list
             data_list = self.params["passed_data"]["prod_price_forecast"]
-            # Check if the passed data has the correct length
-            if (
+            # Check if the passed data has the correct length. None means the
+            # runtime value was rejected (#1135): fail rather than crash.
+            if data_list is None or (
                 len(data_list) < len(self.forecast_dates)
                 and self.params["passed_data"]["prediction_horizon"] is None
             ):
@@ -2489,9 +2978,11 @@ class Forecast:
                 self.logger.info("Saved the forecast results to cache, for later reference.")
 
         # Trim cached data to match requested dates
-        end_forecast = (
-            self.start_forecast + pd.DateOffset(days=self.optim_conf["delta_forecast_daily"].days)
-        ).replace(microsecond=0)
+        end_forecast = add_local_calendar_days(
+            self.start_forecast,
+            self.optim_conf["delta_forecast_daily"].days,
+            self.time_zone,
+        )
         forecast_dates = pd.date_range(
             start=self.start_forecast,
             end=end_forecast - self.freq,

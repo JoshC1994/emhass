@@ -29,10 +29,12 @@ from emhass.forecast_calibration import (
     CALIBRATION_TEST_DAYS,
     CALIBRATION_VAL_DAYS,
     compute_forecast_calibration,
+    trim_to_first_observation,
 )
 from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.optimization import Optimization
+from emhass.pv_bias_calibration import compute_pv_bias_calibration
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import log_runtime_banner, stage_timer
 
@@ -70,15 +72,15 @@ def _record_optim_snapshot(
             duration_total_seconds=_time.monotonic() - t0_monotonic,
             schema_version=EMHASS_SCHEMA_VERSION,
         )
-        # Publish the structured plan ONLY for a successful (Optimal) run, reusing
+        # Publish the structured plan ONLY for a successful run (OK_OPTIM_STATUSES), reusing
         # the SAME timestamp last_run stamped so /api/v1/plan's generated_at matches
         # /api/v1/last-run for that run. Only the timestamp is shared, not the
         # verdict: a failed/infeasible run is still recorded by last_run (status
         # error/infeasible) but must not surface on /api/v1/plan as status "ok" —
         # the plan endpoint keeps serving the last VALID plan (or no-run). Gating on
-        # optim_status == "Optimal" mirrors last_run's own "ok" criterion, so the
+        # last_run.OK_OPTIM_STATUSES reuses last_run's own "ok" criterion, so the
         # two endpoints stay consistent (plan published iff last-run is "ok").
-        if optim_status == "Optimal":
+        if optim_status in last_run.OK_OPTIM_STATUSES:
             plan_store.record(
                 input_data_dict["emhass_conf"]["data_path"],
                 plan=plan_store.serialize(opt_res),
@@ -185,6 +187,7 @@ class OptimizationCacheKey:
     deferrable_load_groups: tuple
     shared_thermal_tanks: tuple  # shared-tank multi-source topology structure
     is_electric_load: tuple  # per-load electric-bus membership flag
+    sequence_load_running_state: tuple  # (index, current state, completed steps) per sequence load
     inverter_is_hybrid: bool
     compute_curtailment: bool
     optimization_time_step_s: float | None
@@ -230,6 +233,12 @@ class OptimizationCache:
         Returns a frozen dataclass that can be directly compared for equality.
         Changes to any field require rebuilding the optimization problem.
         """
+        # Canonicalise the structural multi-component capacity-charge params
+        # (#540 Part B) on a copy before hashing, so capacity_cost_per_kw == 3.0
+        # and == [3.0] (a config-UI singleton list) yield the SAME cache key and
+        # the SAME K=1 model. treat_runtimeparams normally does this upstream;
+        # this keeps direct callers / tests consistent.
+        optim_conf = utils.canonicalize_capacity_charge_config(dict(optim_conf))
 
         def to_seconds(val):
             """Convert Timedelta/timedelta to seconds."""
@@ -342,9 +351,35 @@ class OptimizationCache:
                 # Exclude runtime parameters (start_temperature, desired_temperatures) from hash
                 thermal_hash = config_hash(cfg["thermal_battery"], thermal_runtime_keys)
                 load_type = f"thermal_battery:{thermal_hash}"
+            elif "thermal_source" in cfg:
+                # Shared-tank source block (compiled from heat_topology). Its fields
+                # (COP parameters, max_supply_temperature, ...) are baked into the
+                # problem at build time, not parameterized, so any change must miss
+                # the cache and force a rebuild.
+                thermal_hash = config_hash(cfg["thermal_source"], thermal_runtime_keys)
+                load_type = f"thermal_source:{thermal_hash}"
             else:
                 load_type = "standard"
             def_structure.append((i, load_type))
+
+        # Sequence loads read def_current_state and def_current_operating_timesteps
+        # when the problem is built (they size the start-time variable and cut the
+        # completed steps from the power sequence), so for these loads a change in
+        # either value must miss the cache and rebuild the problem.
+        nominal_powers = optim_conf.get("nominal_power_of_deferrable_loads")
+        if nominal_powers is None:
+            nominal_powers = []
+        current_states = to_tuple(optim_conf.get("def_current_state", []))
+        completed_steps = to_tuple(optim_conf.get("def_current_operating_timesteps", []))
+        sequence_load_running_state = tuple(
+            (
+                i,
+                current_states[i] if i < len(current_states) else None,
+                completed_steps[i] if i < len(completed_steps) else None,
+            )
+            for i, power in enumerate(nominal_powers)
+            if isinstance(power, list)
+        )
 
         return OptimizationCacheKey(
             number_of_deferrable_loads=optim_conf.get("number_of_deferrable_loads", 0),
@@ -394,6 +429,7 @@ class OptimizationCache:
             # is_electric_load changes p_def_sum membership, hence the electric
             # power balance shape, hence structural.
             is_electric_load=to_tuple(optim_conf.get("is_electric_load", [])),
+            sequence_load_running_state=sequence_load_running_state,
             inverter_is_hybrid=plant_conf.get("inverter_is_hybrid", False),
             compute_curtailment=plant_conf.get("compute_curtailment", False),
             optimization_time_step_s=to_seconds(retrieve_hass_conf.get("optimization_time_step")),
@@ -815,7 +851,8 @@ async def adjust_pv_forecast(
     :type emhass_conf: dict
     :param test_df_literal: DataFrame containing test data for debugging purposes.
     :type test_df_literal: pd.DataFrame
-    :return: The adjusted PV forecast as a pandas Series.
+    :return: The adjusted PV forecast as a pandas Series. On handled model training
+        or loading failures, the original unadjusted PV forecast is returned.
     :rtype: pd.Series
     """
     # Normalize data_path to Path object for safety (handles both str and Path types)
@@ -872,8 +909,10 @@ async def adjust_pv_forecast(
             logger.error(
                 f"Unexpected error loading adjusted PV model: {type(e).__name__}: {str(e)}"
             )
-            logger.error("Cannot recover from this error")
-            return False
+            logger.warning(
+                "Unable to load the adjusted PV model. Falling back to unadjusted PV forecast."
+            )
+            return p_pv_forecast
     # Call the predict method
     p_pv_forecast_in = p_pv_forecast.rename("forecast").to_frame()
     try:
@@ -1947,7 +1986,8 @@ async def _get_dayahead_pv_forecast(ctx: SetupContext):
     df_weather = await ctx.fcst.get_weather_forecast(
         method=ctx.optim_conf["weather_forecast_method"]
     )
-    if isinstance(df_weather, bool) and not df_weather:
+    # None: e.g. a rejected runtime PV forecast (#1135) - fail, don't crash.
+    if df_weather is None or (isinstance(df_weather, bool) and not df_weather):
         return None, None
     p_pv_forecast = ctx.fcst.get_power_from_weather(df_weather)
     # Adjust PV forecast if needed
@@ -2062,7 +2102,8 @@ async def _get_naive_mpc_pv_forecast(ctx: SetupContext, set_mix_forecast, df_inp
     df_weather = await ctx.fcst.get_weather_forecast(
         method=ctx.optim_conf["weather_forecast_method"]
     )
-    if isinstance(df_weather, bool) and not df_weather:
+    # None: e.g. a rejected runtime PV forecast (#1135) - fail, don't crash.
+    if df_weather is None or (isinstance(df_weather, bool) and not df_weather):
         return None, None
     # Calculate PV power
     p_pv_forecast = ctx.fcst.get_power_from_weather(
@@ -2235,21 +2276,25 @@ async def set_input_data_dict(
     retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params, logger)
     if type(retrieve_hass_conf) is bool:
         return False
-    (
-        params,
-        retrieve_hass_conf,
-        optim_conf,
-        plant_conf,
-    ) = await utils.treat_runtimeparams(
-        runtimeparams,
-        params,
-        retrieve_hass_conf,
-        optim_conf,
-        plant_conf,
-        set_type,
-        logger,
-        emhass_conf,
-    )
+    try:
+        (
+            params,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+        ) = await utils.treat_runtimeparams(
+            runtimeparams,
+            params,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            set_type,
+            logger,
+            emhass_conf,
+        )
+    except utils.SocFractionError:
+        # The fraction-vs-percentage error is already logged. Stop before the solver.
+        return False
     log_runtime_banner(logger, optim_conf=optim_conf)
     if isinstance(params, str):
         params = dict(orjson.loads(params))
@@ -2295,6 +2340,8 @@ async def set_input_data_dict(
     if set_type in actions_without_fcst_or_opt:
         fcst = None
         opt = None
+        # No Forecast consumes the captured start, so do not carry it along.
+        (params.get("passed_data") or {}).pop("forecast_start", None)
         logger.debug(f"Skipping Optimization creation for action: {set_type}")
     else:
         fcst = Forecast(
@@ -2312,11 +2359,33 @@ async def set_input_data_dict(
         else:
             # Try to get cached Optimization object for warm-starting
             _num_ts = len(fcst.forecast_dates)
-            opt = OptimizationCache.get(
-                optim_conf, plant_conf, costfun, retrieve_hass_conf, logger, _num_ts
+            # Shared thermal tanks bake ALL forecast-dependent state
+            # (start_temperature, heating demand, COP arrays, thermal losses,
+            # min/max temperatures) into the problem as plain constants in
+            # _add_shared_thermal_tank_constraints. The warm-start cache reuses a
+            # built problem (self.prob) and the cache-hit refresh path only
+            # updates thermal_config / thermal_battery CVXPY Parameters, never
+            # shared tanks. Reusing it would therefore re-solve every MPC tick
+            # against the FIRST tick's tank temperature and forecast, silently
+            # discarding the MPC feedback signal (issue #970). Build fresh each
+            # run when shared tanks are present so the live tank state and
+            # forecast are honored. (A future optimization could parameterize
+            # these like thermal_battery to restore warm-starting.)
+            use_optim_cache = not optim_conf.get("shared_thermal_tanks")
+            opt = (
+                OptimizationCache.get(
+                    optim_conf, plant_conf, costfun, retrieve_hass_conf, logger, _num_ts
+                )
+                if use_optim_cache
+                else None
             )
             if opt is None:
-                # Cache miss - create new Optimization object
+                # Cache miss (or cache bypassed) - create new Optimization object
+                if not use_optim_cache:
+                    logger.debug(
+                        "OptimizationCache bypassed: shared_thermal_tanks present; "
+                        "rebuilding so MPC tank-temperature feedback is honored (#970)"
+                    )
                 opt = Optimization(
                     retrieve_hass_conf,
                     optim_conf,
@@ -2328,10 +2397,11 @@ async def set_input_data_dict(
                     logger,
                     num_timesteps=_num_ts,
                 )
-                # Store in cache for future warm-starts
-                OptimizationCache.put(
-                    opt, optim_conf, plant_conf, costfun, retrieve_hass_conf, logger, _num_ts
-                )
+                # Store in cache for future warm-starts (not for shared tanks)
+                if use_optim_cache:
+                    OptimizationCache.put(
+                        opt, optim_conf, plant_conf, costfun, retrieve_hass_conf, logger, _num_ts
+                    )
             else:
                 # Cache hit - update references that may have changed
                 # (logger, var names from forecast, and runtime-configurable optim_conf values)
@@ -2629,6 +2699,17 @@ def prepare_forecast_and_weather_data(
     passed_outdoor_temp = input_data_dict["params"]["passed_data"].get(
         "outdoor_temperature_forecast"
     )
+    # Absence and rejection are different contracts. A genuinely omitted
+    # runtime temperature may use the existing weather-temperature fallback;
+    # a supplied value rejected by #1135 must fail closed.
+    if passed_outdoor_temp is None and input_data_dict["params"]["passed_data"].get(
+        "_outdoor_temperature_forecast_rejected", False
+    ):
+        logger.error(
+            "outdoor_temperature_forecast was supplied but rejected; "
+            "not falling back to the weather forecast temperature."
+        )
+        return False
 
     if passed_outdoor_temp is not None:
         forecast_len = len(df_input_data_dayahead)
@@ -2678,9 +2759,7 @@ def prepare_forecast_and_weather_data(
         # Final safety fill (forward/backward) for any remaining gaps
         if df_input_data_dayahead["outdoor_temperature_forecast"].isnull().any():
             df_input_data_dayahead["outdoor_temperature_forecast"] = (
-                df_input_data_dayahead["outdoor_temperature_forecast"]
-                .fillna(method="ffill")
-                .fillna(method="bfill")
+                df_input_data_dayahead["outdoor_temperature_forecast"].ffill().bfill()
             )
 
     # Merge GHI (Global Horizontal Irradiance) from weather forecast if available
@@ -2720,9 +2799,7 @@ def prepare_forecast_and_weather_data(
 
         # Final safety fill
         if df_input_data_dayahead["ghi"].isnull().any():
-            df_input_data_dayahead["ghi"] = (
-                df_input_data_dayahead["ghi"].fillna(method="ffill").fillna(method="bfill")
-            )
+            df_input_data_dayahead["ghi"] = df_input_data_dayahead["ghi"].ffill().bfill()
 
         logger.debug(
             "Merged GHI data into optimization input: mean=%.1f W/m², max=%.1f W/m²",
@@ -2757,8 +2834,17 @@ async def dayahead_forecast_optim(
     _t0 = _time.monotonic()
     soc_init = input_data_dict["params"]["passed_data"].get("soc_init")
     soc_final = input_data_dict["params"]["passed_data"].get("soc_final")
+    # Honour the already-incurred billing-period peak under a capacity tariff,
+    # same as the MPC path. Without this the dayahead solver treats the peak as 0
+    # and minimises the absolute import peak (flat grid), ignoring price arbitrage.
+    current_period_peak = input_data_dict["params"]["passed_data"].get("current_period_peak", None)
     logger.info(
         f"Performing day-ahead forecast optimization with soc_init: {soc_init}, soc_final: {soc_final}"
+        + (
+            f", current_period_peak: {current_period_peak!r}"
+            if current_period_peak is not None
+            else ""
+        )
     )
     # Prepare forecast data with costs, prices, outdoor temp, and GHI
     with stage_timer(input_data_dict["stage_times"], "price_prep", logger):
@@ -2774,6 +2860,7 @@ async def dayahead_forecast_optim(
             input_data_dict["p_load_forecast"],
             soc_init=soc_init,
             soc_final=soc_final,
+            current_period_peak=current_period_peak,
             stage_times=input_data_dict["stage_times"],
         )
     # Save CSV file for publish_data
@@ -2852,6 +2939,9 @@ async def naive_mpc_optim(
     capacity_charge_window = input_data_dict["params"]["passed_data"].get(
         "capacity_charge_window", None
     )
+    capacity_charge_consideration = input_data_dict["params"]["passed_data"].get(
+        "capacity_charge_consideration", None
+    )
     capacity_charge_current_interval_history = input_data_dict["params"]["passed_data"].get(
         "capacity_charge_current_interval_history", None
     )
@@ -2879,6 +2969,7 @@ async def naive_mpc_optim(
             soc_target_timestep=soc_target_timestep,
             current_period_peak=current_period_peak,
             capacity_charge_window=capacity_charge_window,
+            capacity_charge_consideration=capacity_charge_consideration,
             capacity_charge_current_interval_history=capacity_charge_current_interval_history,
             def_total_hours=def_total_hours,
             def_total_timestep=def_total_timestep,
@@ -3032,6 +3123,13 @@ async def forecast_calibration(input_data_dict: dict, logger: logging.Logger) ->
     if not await rh.get_data(days_list, [var_model]):
         logger.error("Forecast calibration: failed to retrieve load history from Home Assistant")
         return None
+    history = trim_to_first_observation(rh.df_final, var_model)
+    if history is None:
+        logger.error(
+            f"Forecast calibration: no observation of {var_model} in the retrieved history"
+        )
+        return None
+    rh.df_final = history
     rh.prepare_data(
         var_model,
         load_negative=retrieve_hass_conf.get("load_negative", False),
@@ -3057,6 +3155,49 @@ async def forecast_calibration(input_data_dict: dict, logger: logging.Logger) ->
     if result.get("error"):
         return None
     return result
+
+
+async def pv_bias_calibration(runtimeparams: str | dict | None, logger: logging.Logger) -> dict:
+    """Return the caller-fed PV P10/P50 bias calibration report (#1128).
+
+    This is intentionally only an action/reporting adapter around
+    ``compute_pv_bias_calibration``. It does not retrieve HA history, build a
+    Forecast/Optimization object, persist anything, or apply the recommendation.
+    """
+    if runtimeparams is None:
+        payload = {}
+    elif isinstance(runtimeparams, str):
+        payload = orjson.loads(runtimeparams)
+    elif isinstance(runtimeparams, dict):
+        payload = runtimeparams
+    else:
+        raise ValueError("pv-bias-calibration payload must be a JSON object")
+
+    if not isinstance(payload, dict):
+        raise ValueError("pv-bias-calibration payload must be a JSON object")
+
+    missing = [key for key in ("p10", "p50", "actual") if key not in payload]
+    if missing:
+        raise ValueError(
+            "pv-bias-calibration requires caller-supplied p10, p50, actual; missing "
+            + ", ".join(missing)
+        )
+
+    optional_keys = (
+        "curtailed",
+        "curtailment_margin",
+        "target_shortfall_rate",
+        "gamma",
+        "bias0",
+    )
+    kwargs = {key: payload[key] for key in optional_keys if key in payload}
+    return compute_pv_bias_calibration(
+        payload["p10"],
+        payload["p50"],
+        payload["actual"],
+        logger=logger,
+        **kwargs,
+    )
 
 
 async def forecast_model_predict(
@@ -3106,6 +3247,15 @@ async def forecast_model_predict(
     # Make predictions
     if use_last_window:
         data_last_window = copy.deepcopy(input_data_dict["df_input_data"])
+        # A model saved before var_model followed the configured load sensor may have been
+        # trained on another sensor than the one retrieved for this call (#1208).
+        var_model = input_data_dict["params"]["passed_data"]["var_model"]
+        if mlf.var_model not in data_last_window.columns and var_model in data_last_window.columns:
+            logger.warning(
+                f"The saved model was trained on {mlf.var_model} but {var_model} was retrieved, "
+                f"using it as the last window. Run forecast-model-fit to retrain on {var_model}."
+            )
+            data_last_window = data_last_window.rename(columns={var_model: mlf.var_model})
     else:
         data_last_window = None
     # When the model was trained with weather covariates, supply the future weather over the
@@ -3451,7 +3601,7 @@ async def export_influxdb_to_csv(
     )
     logger.info(f"Sensors: {sensor_list}")
     # Retrieve data from InfluxDB
-    success = rh.get_data(days_list, sensor_list)
+    success = await rh.get_data(days_list, sensor_list)
     if not success or rh.df_final is None or rh.df_final.empty:
         logger.error("Failed to retrieve data from InfluxDB")
         return False
@@ -3504,17 +3654,23 @@ async def _publish_from_saved_entities(
         logger.warning(f"No saved entity json files in path: {entity_path}")
         logger.warning("Falling back to opt_res_latest")
         return None
-    entity_path_contents = os.listdir(entity_path)
+    # Skip the metadata file and any in-flight atomic-write temp file
+    # ("<name>.json.<pid>.<uuid>.tmp") left by retrieve_hass.post_data -
+    # publishing one derives a bogus entity_id and KeyErrors on the metadata
+    # lookup, aborting the whole publish.
+    entity_path_contents = [
+        entity
+        for entity in os.listdir(entity_path)
+        if entity != default_metadata_json and not entity.endswith(".tmp")
+    ]
     matches_prefix = any(publish_prefix in entity for entity in entity_path_contents)
-    if not (matches_prefix or publish_prefix == "all"):
+    if not entity_path_contents or not (matches_prefix or publish_prefix == "all"):
         logger.warning(f"No saved entity json files that match prefix: {publish_prefix}")
         logger.warning("Falling back to opt_res_latest")
         return None
     opt_res_list = []
     opt_res_list_names = []
     for entity in entity_path_contents:
-        if entity == default_metadata_json:
-            continue
         if publish_prefix == "all" or publish_prefix in entity:
             entity_data = await publish_json(entity, input_data_dict, entity_path, logger)
             if isinstance(entity_data, bool):
@@ -3563,13 +3719,15 @@ def _get_closest_index(retrieve_hass_conf: dict, index: pd.DatetimeIndex) -> int
     elif index.tz is not None and now_ts.tz is None:
         now_ts = now_ts.tz_localize(index.tz)
     method = retrieve_hass_conf.get("method_ts_round", "nearest")
-    if method == "nearest":
-        return index.get_indexer([now_ts], method="nearest")[0]
-    elif method == "first":
-        return index.get_indexer([now_ts], method="ffill")[0]
+    if method == "first":
+        idx_closest = index.get_indexer([now_ts], method="ffill")[0]
     elif method == "last":
-        return index.get_indexer([now_ts], method="bfill")[0]
-    return index.get_indexer([now_ts], method="nearest")[0]
+        idx_closest = index.get_indexer([now_ts], method="bfill")[0]
+    else:
+        idx_closest = index.get_indexer([now_ts], method="nearest")[0]
+    if idx_closest == -1:
+        idx_closest = index.get_indexer([now_ts], method="nearest")[0]
+    return idx_closest
 
 
 async def _publish_standard_forecasts(
@@ -3784,7 +3942,13 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
         if k >= len(def_load_config):
             continue
         load_cfg = def_load_config[k]
-        if "thermal_config" not in load_cfg and "thermal_battery" not in load_cfg:
+        # heat_topology compiles each load to a {"thermal_source": ...} block; it must
+        # publish its predicted temperature / heating demand like thermal_config and
+        # thermal_battery do (issue #539 - the OptimizationCacheKey path already handles
+        # thermal_source, this gate was the one spot that did not).
+        if not any(
+            k2 in load_cfg for k2 in ("thermal_config", "thermal_battery", "thermal_source")
+        ):
             continue
         col_t = await _publish_thermal_variable(
             ctx.rh,
@@ -4091,8 +4255,8 @@ async def continual_publish(
     while True:
         # Sleep for x seconds (using current time as a reference for time left)
         time_zone = input_data_dict["retrieve_hass_conf"]["time_zone"]
-        timestamp_diff = freq.total_seconds() - (datetime.now(time_zone).timestamp() % 60)
-        sleep_seconds = max(0.0, min(timestamp_diff, 60.0))
+        period = freq.total_seconds()
+        sleep_seconds = period - (datetime.now(time_zone).timestamp() % period)
         await asyncio.sleep(sleep_seconds)
         # Delegate processing to helper function to reduce complexity. A
         # transient failure in a single cycle (e.g. a half-written entity file
@@ -4224,6 +4388,16 @@ async def publish_json(
     return entity_data[metadata[entity_id]["name"]]
 
 
+def _parse_bool_arg(value: str) -> bool:
+    """Parse a boolean command line value; argparse `type=bool` reads any text as True."""
+    value = value.lower()
+    if value in {"true", "1", "yes", "on"}:
+        return True
+    if value in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got {value!r}")
+
+
 async def main():
     r"""Define the main command line entry function.
 
@@ -4231,7 +4405,7 @@ async def main():
 
     - action: Set the desired action, options are: perfect-optim, dayahead-optim,
       naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,
-      forecast-calibration
+      forecast-calibration, pv-bias-calibration
 
     - config: Define path to the config.yaml file
 
@@ -4253,7 +4427,7 @@ async def main():
         type=str,
         help="Set the desired action, options are: perfect-optim, dayahead-optim,\
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
-        forecast-calibration",
+        forecast-calibration, pv-bias-calibration",
     )
     parser.add_argument(
         "--config", type=str, help="Define path to the config.json/defaults.json file"
@@ -4274,7 +4448,7 @@ async def main():
     )
     parser.add_argument(
         "--log2file",
-        type=bool,
+        type=_parse_bool_arg,
         default=False,
         help="Define if we should log to a file or not",
     )
@@ -4292,7 +4466,7 @@ async def main():
     )
     parser.add_argument(
         "--debug",
-        type=bool,
+        type=_parse_bool_arg,
         default=False,
         help="Use True for testing purposes",
     )
@@ -4411,6 +4585,16 @@ async def main():
     if args.params:
         params.update(orjson.loads(args.params))
 
+    # #1128: pure caller-fed calibration bypasses set_input_data_dict()
+    # entirely. In particular, it must not contact Home Assistant, construct an
+    # optimizer, write config, or apply its recommendation.
+    if args.action == "pv-bias-calibration":
+        result = await pv_bias_calibration(args.runtimeparams, logger)
+        logger.info(result)
+        ch.close()
+        logger.removeHandler(ch)
+        return result
+
     input_data_dict = await set_input_data_dict(
         emhass_conf,
         args.costfun,
@@ -4474,7 +4658,7 @@ async def main():
     else:
         logger.error("The passed action argument is not valid")
         logger.error(
-            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, export-influxdb-to-csv or publish-data"
+            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, pv-bias-calibration, export-influxdb-to-csv or publish-data"
         )
         opt_res = None
     logger.info(opt_res)

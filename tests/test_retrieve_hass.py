@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiofiles
+import aiohttp
 import numpy as np
 import orjson
 import pandas as pd
@@ -325,6 +326,197 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         # Verify no missing values in the actual and forecast PV columns after prepare_data
         self.assertEqual(self.rh.df_final[actual_pv_sensor].isna().sum(), 0)
         self.assertEqual(self.rh.df_final[forecast_pv_sensor].isna().sum(), 0)
+
+    # Issue #1084: a var_replace_zero/var_interp entry that doesn't match any
+    # retrieved sensor is silently dropped. If that silence coincides with
+    # NaNs surviving cleaning elsewhere, it is a strong signal of a
+    # sensor-name typo in the config, so prepare_data must warn once, naming
+    # both the dropped entry and the still-affected column.
+    def test_prepare_data_dropped_sensor_warns_when_nan_remains(self):
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        actual_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics"]
+        forecast_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics_forecast"]
+        # Zero out a value in a column NOT covered by either repair list below,
+        # so set_zero_min turns it into an unrepaired NaN.
+        self.rh.df_final.loc[self.rh.df_final.index[0], forecast_pv_sensor] = 0.0
+        with self.assertLogs(logger, level="WARNING") as cm:
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=[actual_pv_sensor],
+                var_interp=[actual_pv_sensor, load_sensor, "sensor.missing_typo"],
+            )
+        self.assertEqual(
+            sum("sensor.missing_typo" in line for line in cm.output),
+            1,
+            f"expected exactly one warning naming the dropped sensor, got: {cm.output}",
+        )
+        self.assertTrue(
+            any(forecast_pv_sensor in line for line in cm.output),
+            f"expected the warning to name the still-NaN column, got: {cm.output}",
+        )
+
+    # Mirror of the test above for the sensor_replace_zero half: a dropped
+    # replace-zero entry plus a surviving NaN must fire the warning naming
+    # the parameter and the dropped entry.
+    def test_prepare_data_dropped_replace_zero_warns_when_nan_remains(self):
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        actual_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics"]
+        forecast_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics_forecast"]
+        self.rh.df_final.loc[self.rh.df_final.index[0], forecast_pv_sensor] = 0.0
+        with self.assertLogs(logger, level="WARNING") as cm:
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=[actual_pv_sensor, "sensor.missing_typo"],
+                var_interp=[actual_pv_sensor, load_sensor],
+            )
+        warning_lines = [line for line in cm.output if "sensor.missing_typo" in line]
+        self.assertEqual(len(warning_lines), 1, f"expected one dropped-sensor warning: {cm.output}")
+        self.assertIn("sensor_replace_zero", warning_lines[0])
+        self.assertIn(forecast_pv_sensor, warning_lines[0])
+
+    # Correctly-configured lists (nothing dropped) must never trigger the
+    # dropped-sensor warning, even when an unrelated NaN legitimately survives.
+    def test_prepare_data_no_warning_when_no_sensor_dropped(self):
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        actual_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics"]
+        forecast_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics_forecast"]
+        # Same unrepaired-NaN setup as above, but every configured sensor name
+        # actually matches a retrieved column this time: nothing is dropped.
+        self.rh.df_final.loc[self.rh.df_final.index[0], forecast_pv_sensor] = 0.0
+        with self.assertNoLogs(logger, level="WARNING"):
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=[actual_pv_sensor],
+                var_interp=[actual_pv_sensor, load_sensor],
+            )
+
+    # A dropped entry with nothing left to warn about (every column is fully
+    # repaired) must not trigger a warning either.
+    def test_prepare_data_no_warning_when_dropped_but_no_nan_remains(self):
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        actual_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics"]
+        forecast_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics_forecast"]
+        with self.assertNoLogs(logger, level="WARNING"):
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=[actual_pv_sensor, forecast_pv_sensor, "sensor.missing_typo"],
+                var_interp=[
+                    actual_pv_sensor,
+                    forecast_pv_sensor,
+                    load_sensor,
+                    "sensor.missing_typo",
+                ],
+            )
+
+    # The exact #1084 trap: the load sensor is missing from the repair lists
+    # (stale entry dropped), its zero readings become unrepaired NaN, and the
+    # warning must name it under its CONFIGURED name, not the internal
+    # var_load + "_positive" rename.
+    def test_prepare_data_warning_names_configured_load_name_not_rename(self):
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        actual_pv_sensor = self.retrieve_hass_conf["sensor_power_photovoltaics"]
+        # A zero load reading becomes NaN via set_zero_min; the load sensor is
+        # absent from var_interp, so nothing repairs it.
+        self.rh.df_final.loc[self.rh.df_final.index[0], load_sensor] = 0.0
+        with self.assertLogs(logger, level="WARNING") as cm:
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=[actual_pv_sensor],
+                var_interp=[actual_pv_sensor, "sensor.missing_typo"],
+            )
+        warning_lines = [line for line in cm.output if "sensor.missing_typo" in line]
+        self.assertEqual(len(warning_lines), 1, f"expected one dropped-sensor warning: {cm.output}")
+        self.assertIn(load_sensor, warning_lines[0])
+        self.assertNotIn(load_sensor + "_positive", warning_lines[0])
+
+    # The battery-identification path deliberately retrieves a subset of the
+    # configured sensors (no PV) and keeps by-design NaN in its protected
+    # battery columns, so structurally dropped entries plus protected-column
+    # NaN must never trigger the dropped-sensor warning.
+    def test_prepare_data_no_warning_for_protected_nan_only(self):
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        battery_sensor = "sensor.power_battery"
+        idx = self.rh.df_final.index[:8]
+        self.rh.df_final = pd.DataFrame(
+            {
+                load_sensor: [100.0] * 8,
+                battery_sensor: [50.0, -50.0, np.nan, 30.0, -30.0, 0.0, 20.0, 10.0],
+            },
+            index=idx,
+        )
+        self.rh.var_list = [load_sensor, battery_sensor]
+        with self.assertNoLogs(logger, level="WARNING"):
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=["sensor.power_photovoltaics_not_retrieved"],
+                var_interp=["sensor.power_photovoltaics_not_retrieved", load_sensor],
+                protected_columns=[battery_sensor],
+            )
+        # The by-design NaN in the protected column must survive untouched.
+        self.assertTrue(self.rh.df_final[battery_sensor].isna().any())
+
+    # protected_columns holds CONFIGURED sensor names, but the load column is
+    # renamed to var_load + "_positive" before the dropped-sensor NaN check
+    # runs, so a protected load must keep its exclusion across the rename. A
+    # zero load reading turned NaN by set_zero_min plus a structurally dropped
+    # entry must not fire the warning for the protected load.
+    def test_prepare_data_protected_load_keeps_exclusion_across_rename(self):
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        idx = self.rh.df_final.index[:4]
+        self.rh.df_final = pd.DataFrame(
+            {load_sensor: [100.0, 0.0, 200.0, 150.0]},
+            index=idx,
+        )
+        self.rh.var_list = [load_sensor]
+        with self.assertNoLogs(logger, level="WARNING"):
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=["sensor.power_photovoltaics_not_retrieved"],
+                var_interp=["sensor.power_photovoltaics_not_retrieved"],
+                protected_columns=[load_sensor],
+            )
+        # The unrepaired NaN really is present under the renamed column, so
+        # the no-warning assertion above exercised the exclusion, not an
+        # accidentally clean frame.
+        self.assertTrue(self.rh.df_final[load_sensor + "_positive"].isna().any())
+
+    # The single-sensor ML paths (model fit/tune/predict, forecast calibration)
+    # retrieve only their target sensor while forwarding the full configured
+    # lists, and mark themselves with skip_renaming=True. Dropped entries are
+    # structural there and must never trigger the dropped-sensor warning, even
+    # when the target column keeps an unrepaired NaN (e.g. a legitimate zero
+    # reading turned NaN by set_zero_min).
+    def test_prepare_data_no_warning_when_skip_renaming(self):
+        var_model = "sensor.my_custom_model_input"
+        idx = self.rh.df_final.index[:4]
+        self.rh.df_final = pd.DataFrame(
+            {var_model: [100.0, 0.0, 200.0, 150.0]},
+            index=idx,
+        )
+        self.rh.var_list = [var_model]
+        with self.assertNoLogs(logger, level="WARNING"):
+            self.rh.prepare_data(
+                var_model,
+                load_negative=False,
+                set_zero_min=True,
+                var_replace_zero=["sensor.power_photovoltaics"],
+                var_interp=["sensor.power_photovoltaics", "sensor.power_load_no_var_loads"],
+                skip_renaming=True,
+            )
 
     # Battery identification needs the signed battery power and a possible
     # measured 0% SoC to survive prepare_data's set_zero_min treatment (#1041).
@@ -859,6 +1051,521 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         success = await rh_influx.get_data(days_list, ["sensor.power_a", "sensor.power_missing"])
         self.assertTrue(success)
         self.assertEqual(list(rh_influx.df_final.columns), ["sensor.power_a"])
+
+    # ------------------------------------------------------------------
+    # VictoriaMetrics data source: PromQL query_range over HTTP, mocked at the
+    # single request helper (_vm_query_range) so no network is involved.
+
+    def _make_vm_rh(self, **overrides):
+        """Build a RetrieveHass instance configured to use VictoriaMetrics."""
+        conf = {
+            "use_victoriametrics": True,
+            "victoriametrics_host": "fake-vm",
+            "victoriametrics_port": 8428,
+            "victoriametrics_username": "fake-user",
+            "victoriametrics_password": "fake-pass",  # pragma: allowlist secret
+            "victoriametrics_database": "homeassistant",
+        }
+        conf.update(overrides)
+        return RetrieveHass(
+            self.retrieve_hass_conf["hass_url"],
+            self.retrieve_hass_conf["long_lived_token"],
+            self.retrieve_hass_conf["optimization_time_step"],
+            self.retrieve_hass_conf["time_zone"],
+            {"retrieve_hass_conf": conf},
+            emhass_conf,
+            logger,
+            get_data_from_file=False,
+        )
+
+    @staticmethod
+    def _vm_query_side_effect(entity_data, calls=None, keep_metric_name=True):
+        """Build a ``_vm_query_range`` side_effect emulating VictoriaMetrics.
+
+        :param entity_data: mapping of entity_id label -> list of series, each a tuple
+            ``(metric_name, [(bucket_start_iso, value), ...])``. Timestamps are given as
+            the START of the bucket (the label EMHASS must produce); the fake server
+            returns them the way VictoriaMetrics does, at the END of the
+            ``avg_over_time`` window (bucket start + step). An empty list emulates an
+            entity with no data.
+        :param calls: optional list collecting ``(query, start, end, step)`` per call.
+        :param keep_metric_name: emulate MetricsQL (``__name__`` kept through
+            ``avg_over_time``, the default) or a plain PromQL backend that drops it.
+        """
+
+        async def query_side_effect(session, query, start_s, end_s, step_s):
+            if calls is not None:
+                calls.append((query, start_s, end_s, step_s))
+            entity_id = query.split('entity_id="')[1].split('"')[0]
+            result = []
+            for metric_name, points in entity_data.get(entity_id, []):
+                values = []
+                for ts_iso, value in points:
+                    ts = int(pd.Timestamp(ts_iso).timestamp()) + step_s
+                    if start_s <= ts <= end_s:
+                        values.append([ts, str(value)])
+                if values:
+                    metric = {"entity_id": entity_id, "domain": "sensor"}
+                    if keep_metric_name:
+                        metric["__name__"] = metric_name
+                    result.append({"metric": metric, "values": values})
+            return result
+
+        return query_side_effect
+
+    def test_vm_selector(self):
+        """The selector matches on entity_id/domain labels and a metric name regex."""
+        rh = self._make_vm_rh()
+        self.assertEqual(
+            rh._vm_selector("sensor.power_a"),
+            '{entity_id="power_a",__name__=~".+_value",domain="sensor",db="homeassistant"}',
+        )
+        # No domain in the entry and no database filter configured
+        rh = self._make_vm_rh(victoriametrics_database="", victoriametrics_metric_regex="W_value")
+        self.assertEqual(rh._vm_selector("power_a"), '{entity_id="power_a",__name__=~"W_value"}')
+        # Quotes and backslashes in a value cannot break out of the matcher
+        self.assertIn('entity_id="a\\"b\\\\c"', rh._vm_selector('sensor.a"b\\c'))
+
+    def test_vm_connection_settings(self):
+        """Host/port/ssl/auth settings map onto the HTTP client arguments."""
+        rh = self._make_vm_rh()
+        self.assertEqual(rh._vm_base_url(), "http://fake-vm:8428")
+        self.assertEqual(rh._vm_auth().login, "fake-user")
+        self.assertIsNone(rh._vm_ssl())
+        rh = self._make_vm_rh(
+            victoriametrics_username="",
+            victoriametrics_use_ssl=True,
+            victoriametrics_verify_ssl=False,
+        )
+        self.assertEqual(rh._vm_base_url(), "https://fake-vm:8428")
+        self.assertIsNone(rh._vm_auth())
+        self.assertIs(rh._vm_ssl(), False)
+
+    async def test_get_data_victoriametrics_mock(self):
+        """get_data routes to VictoriaMetrics and yields the InfluxDB-shaped frame."""
+        rh = self._make_vm_rh()
+        calls = []
+        side_effect = self._vm_query_side_effect(
+            {
+                "power_photovoltaics": [
+                    (
+                        "W_value",
+                        [("2023-04-01T10:00:00Z", 1500.0), ("2023-04-01T10:30:00Z", 1800.0)],
+                    )
+                ],
+                "power_load_no_var_loads": [
+                    ("W_value", [("2023-04-01T10:00:00Z", 500.0), ("2023-04-01T10:30:00Z", 450.0)])
+                ],
+            },
+            calls,
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        var_list = ["sensor.power_photovoltaics", "sensor.power_load_no_var_loads"]
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            success = await rh.get_data(days_list, var_list)
+        self.assertTrue(success)
+
+        df = rh.df_final
+        self.assertEqual(list(df.columns), var_list)
+        # The grid is held (FILL previous) from the first sample through the last bucket
+        # strictly before end_time (2023-04-02T00:00:00Z), i.e. 10:00 .. 23:30 at 30min.
+        self.assertEqual(len(df), 28)
+        self.assertEqual(df.index.freq, pd.Timedelta("30min"))
+        self.assertEqual(str(df.index.tz), "UTC")
+        # Buckets are labelled by their start, like InfluxDB GROUP BY time()
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][var_list[0]], 1500.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:30:00+00:00"][var_list[1]], 450.0)
+        # The terminal state (last known sample) is held through the last eligible bucket
+        self.assertAlmostEqual(df.loc["2023-04-01 23:30:00+00:00"][var_list[0]], 1800.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 23:30:00+00:00"][var_list[1]], 450.0)
+        self.assertEqual(rh.var_list, var_list)
+        # One query_range call per sensor, on a step-aligned grid at the optimization step
+        self.assertEqual(len(calls), 2)
+        query, start_s, end_s, step_s = calls[0]
+        self.assertEqual(step_s, 1800)
+        self.assertEqual(start_s % 1800, 0)
+        self.assertEqual(start_s, int(pd.Timestamp("2023-04-01T00:30:00Z").timestamp()))
+        self.assertEqual(end_s, int(pd.Timestamp("2023-04-02T00:00:00Z").timestamp()))
+        self.assertTrue(query.startswith("avg_over_time({entity_id="))
+        self.assertTrue(query.endswith("}[1800s])"))
+
+    async def test_get_data_victoriametrics_fill_previous(self):
+        """Empty buckets are forward-filled like InfluxDB FILL(previous)."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "price": [
+                    (
+                        "EUR/kWh_value",
+                        [("2023-04-01T10:00:00Z", 0.2), ("2023-04-01T11:30:00Z", 0.3)],
+                    )
+                ],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            self.assertTrue(await rh.get_data(days_list, ["sensor.price"]))
+        df = rh.df_final
+        # Internal gap (10:00 -> 11:30) uses the previous value; the terminal state (0.3)
+        # is then held through the last bucket strictly before end_time (23:30).
+        self.assertEqual(len(df), 28)
+        self.assertEqual(df["sensor.price"].tolist()[:4], [0.2, 0.2, 0.2, 0.3])
+        self.assertEqual(df["sensor.price"].tolist()[4:], [0.3] * 24)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 23:30:00+00:00"))
+
+    async def test_get_data_victoriametrics_multiple_metrics(self):
+        """When a sensor changed unit the metric with the most samples is kept."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "power_a": [
+                    ("kW_value", [("2023-04-01T09:30:00Z", 1.0)]),
+                    (
+                        "W_value",
+                        [("2023-04-01T10:00:00Z", 1000.0), ("2023-04-01T10:30:00Z", 1200.0)],
+                    ),
+                ],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        with (
+            patch.object(rh, "_vm_query_range", side_effect=side_effect),
+            self.assertLogs(logger, level="WARNING") as logs,
+        ):
+            self.assertTrue(await rh.get_data(days_list, ["sensor.power_a"]))
+        values = rh.df_final["sensor.power_a"].tolist()
+        self.assertEqual(values[:2], [1000.0, 1200.0])
+        self.assertEqual(values[2:], [1200.0] * 26)
+        self.assertTrue(any("several VictoriaMetrics metrics" in line for line in logs.output))
+
+    async def test_get_data_victoriametrics_metric_name_dropped(self):
+        """A backend that drops __name__ still yields one series per label set.
+
+        Two unit metrics of one sensor then collapse into one series with overlapping
+        timestamps: the first value is kept and a warning is logged, instead of failing.
+        """
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "power_a": [
+                    ("kW_value", [("2023-04-01T10:00:00Z", 1.0)]),
+                    (
+                        "W_value",
+                        [("2023-04-01T10:00:00Z", 1000.0), ("2023-04-01T10:30:00Z", 1200.0)],
+                    ),
+                ],
+            },
+            keep_metric_name=False,
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        with (
+            patch.object(rh, "_vm_query_range", side_effect=side_effect),
+            self.assertLogs(logger, level="WARNING") as logs,
+        ):
+            self.assertTrue(await rh.get_data(days_list, ["sensor.power_a"]))
+        values = rh.df_final["sensor.power_a"].tolist()
+        self.assertEqual(len(rh.df_final), 28)
+        self.assertEqual(values[:2], [1.0, 1200.0])
+        self.assertEqual(values[2:], [1200.0] * 26)
+        self.assertTrue(any("duplicate timestamps" in line for line in logs.output))
+        self.assertFalse(any("several VictoriaMetrics metrics" in line for line in logs.output))
+
+    async def test_get_data_victoriametrics_expression_mixed(self):
+        """var_list may mix a plain sensor and a {{ ... }} expression, as with InfluxDB."""
+        rh = self._make_vm_rh()
+        calls = []
+        side_effect = self._vm_query_side_effect(
+            {
+                "power_a": [
+                    (
+                        "W_value",
+                        [("2023-04-01T10:00:00Z", 1500.0), ("2023-04-01T10:30:00Z", 1800.0)],
+                    )
+                ],
+                "power_b": [
+                    ("kW_value", [("2023-04-01T10:00:00Z", 0.5), ("2023-04-01T10:30:00Z", 0.3)])
+                ],
+            },
+            calls,
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        expression = "{{'sensor.power_a' - 'sensor.power_b' * 1000}}"
+        var_list = ["sensor.power_a", expression]
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            self.assertTrue(await rh.get_data(days_list, var_list))
+        df = rh.df_final
+        self.assertEqual(list(df.columns), var_list)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"]["sensor.power_a"], 1500.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][expression], 1000.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:30:00+00:00"][expression], 1500.0)
+        # Plain entry over the requested window, expression entities over a padded one:
+        # power_a is fetched twice (plain + expression), power_b once (expression only)
+        from emhass.retrieve_hass import INFLUX_EXPRESSION_LOOKBACK
+
+        window_starts: dict[str, list[int]] = {}
+        for q, s, _, _ in calls:
+            window_starts.setdefault(q.split('entity_id="')[1].split('"')[0], []).append(s)
+        lookback = int(INFLUX_EXPRESSION_LOOKBACK.total_seconds())
+        self.assertEqual(len(window_starts["power_a"]), 2)
+        self.assertEqual(max(window_starts["power_a"]) - min(window_starts["power_a"]), lookback)
+        self.assertEqual(window_starts["power_b"], [min(window_starts["power_a"])])
+
+    async def test_get_data_victoriametrics_missing_sensor_and_entity(self):
+        """A missing plain sensor is skipped; a missing expression entity fails cleanly."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "power_a": [
+                    (
+                        "W_value",
+                        [("2023-04-01T10:00:00Z", 1500.0), ("2023-04-01T10:30:00Z", 1800.0)],
+                    )
+                ],
+                "power_missing": [],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            self.assertTrue(
+                await rh.get_data(days_list, ["sensor.power_a", "sensor.power_missing"])
+            )
+            self.assertEqual(list(rh.df_final.columns), ["sensor.power_a"])
+            self.assertFalse(
+                await rh.get_data(days_list, ["{{'sensor.power_a' + 'sensor.power_missing'}}"])
+            )
+
+    async def test_get_data_victoriametrics_query_error(self):
+        """A failed query_range (None from the helper) aborts the retrieval."""
+        rh = self._make_vm_rh()
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        with patch.object(rh, "_vm_query_range", return_value=None):
+            self.assertFalse(await rh.get_data(days_list, ["sensor.power_a"]))
+
+    async def test_vm_fetch_chunks_long_windows(self):
+        """Long windows are split into contiguous chunks under the points-per-request cap."""
+        from emhass.retrieve_hass import VM_MAX_POINTS_PER_REQUEST
+
+        rh = self._make_vm_rh()
+        rh.freq = pd.Timedelta("15min")
+        calls = []
+        side_effect = self._vm_query_side_effect({}, calls)
+        start = pd.Timestamp("2025-01-01 00:00:00")
+        end = pd.Timestamp("2026-01-01 00:00:00")  # 35040 steps > 30000 default cap
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                result = await rh._fetch_sensor_data_vm(session, "sensor.power_a", start, end)
+        self.assertIsNone(result)  # no data in the fake server
+        self.assertEqual(len(calls), 4)
+        step = 900
+        for _, s, e, st in calls:
+            self.assertEqual(st, step)
+            self.assertLessEqual((e - s) // step + 1, VM_MAX_POINTS_PER_REQUEST)
+        # Chunks are contiguous, one step apart, and cover the whole window
+        for (_, _, e_prev, _), (_, s_next, _, _) in zip(calls, calls[1:], strict=False):
+            self.assertEqual(s_next, e_prev + step)
+        self.assertEqual(calls[0][1], int(start.tz_localize("UTC").timestamp()) + step)
+        self.assertEqual(calls[-1][2], int(end.tz_localize("UTC").timestamp()))
+
+    # Regression coverage for the VictoriaMetrics terminal FILL(previous) tail defect:
+    # the reindex used to stop at the last SAMPLE timestamp instead of the last ELIGIBLE
+    # bucket before end_time, silently dropping trailing held-state buckets as NaN.
+
+    async def test_vm_fill_previous_no_backward_fill_before_first_sample(self):
+        """Leading buckets before the first known state stay NaN (no backward fill)."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [("2023-04-01T02:00:00Z", 10.0)])]}
+        )
+        start = pd.Timestamp("2023-04-01T00:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        # No buckets at all before the first sample (00:00, 00:30, 01:00, 01:30 absent)
+        self.assertEqual(df.index.min(), pd.Timestamp("2023-04-01 02:00:00+00:00"))
+        self.assertNotIn(pd.Timestamp("2023-04-01 00:00:00+00:00"), df.index)
+        self.assertNotIn(pd.Timestamp("2023-04-01 01:30:00+00:00"), df.index)
+
+    async def test_vm_fill_previous_terminal_state_extends_to_query_end(self):
+        """A sparse state last written before end_time is held through every eligible
+        bucket strictly before end_time (half-open interval [start_time, end_time))."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [("2023-04-01T02:00:00Z", 10.0)])]}
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        # Last eligible bucket is end_time - step = 03:30; no bucket at or beyond end_time
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        self.assertNotIn(pd.Timestamp("2023-04-01 04:00:00+00:00"), df.index)
+        self.assertEqual(df["sensor.sensor_a"].tolist(), [10.0] * len(df))
+
+    async def test_vm_fill_previous_non_aligned_end_time_uses_last_complete_bucket(self):
+        """An off-grid end_time includes only complete buckets wholly inside [start, end)."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [("2023-04-01T02:00:00Z", 10.0)])]}
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:10:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+
+        # With 30-minute buckets, 03:30 labels the final complete bucket (03:30, 04:00].
+        # The next bucket would end at 04:30 and therefore lies outside [start, 04:10).
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        self.assertNotIn(pd.Timestamp("2023-04-01 04:00:00+00:00"), df.index)
+        self.assertTrue((df.index < end).all())
+        self.assertEqual(df["sensor.sensor_a"].tolist(), [10.0] * len(df))
+
+    async def test_vm_fill_previous_terminal_constrained_positive_state_held(self):
+        """A terminal bounded/limited positive state (e.g. a ceiling register) remains at
+        its held value through end_time, not just at the sample timestamp."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "limit_register": [
+                    (
+                        "W_value",
+                        [
+                            ("2023-04-01T02:00:00Z", 0.0),
+                            ("2023-04-01T02:30:00Z", 4000.0),  # becomes constrained/binding
+                        ],
+                    )
+                ]
+            }
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.limit_register", start, end)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        # The binding positive value is held through every trailing bucket, not lost to NaN
+        self.assertEqual(df["sensor.limit_register"].tolist(), [0.0, 4000.0, 4000.0, 4000.0])
+        self.assertFalse(df["sensor.limit_register"].isna().any())
+
+    async def test_vm_fill_previous_terminal_zero_state_held(self):
+        """A terminal non-binding zero state is correctly held at zero through end_time
+        (not merely coincidentally zero because of a NaN->fillna(0.0) downstream bug)."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "limit_register": [
+                    (
+                        "W_value",
+                        [
+                            ("2023-04-01T02:00:00Z", 4000.0),
+                            ("2023-04-01T02:30:00Z", 0.0),  # constraint released
+                        ],
+                    )
+                ]
+            }
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.limit_register", start, end)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        self.assertEqual(df["sensor.limit_register"].tolist(), [4000.0, 0.0, 0.0, 0.0])
+        self.assertFalse(df["sensor.limit_register"].isna().any())
+
+    async def test_vm_fill_previous_transition_at_end_time_excluded(self):
+        """A state transition occurring exactly at end_time must not create a bucket at or
+        beyond end_time, and must not leak backward into earlier buckets."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "sensor_a": [
+                    (
+                        "W_value",
+                        [
+                            ("2023-04-01T02:00:00Z", 10.0),
+                            ("2023-04-01T04:00:00Z", 99.0),  # exactly at end_time
+                        ],
+                    )
+                ]
+            }
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        self.assertNotIn(pd.Timestamp("2023-04-01 04:00:00+00:00"), df.index)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        # The later (end_time) value never leaks backward into earlier held buckets
+        self.assertTrue((df["sensor.sensor_a"] == 10.0).all())
+
+    async def test_vm_fill_previous_terminal_fill_across_chunk_boundary(self):
+        """The terminal fill is correct even when the window spans several VM query
+        chunks (the last sample lands in an earlier chunk than the final bucket)."""
+        rh = self._make_vm_rh()
+        rh.freq = pd.Timedelta("15min")
+        from emhass.retrieve_hass import VM_MAX_POINTS_PER_REQUEST
+
+        step = 900
+        chunk_span_steps = VM_MAX_POINTS_PER_REQUEST
+        # Last sample lands in the first chunk; the window extends ~1.5 chunks further so
+        # the terminal fill must be carried through a chunk boundary with no new data.
+        start = pd.Timestamp("2025-01-01T00:00:00Z")
+        last_sample = start + pd.Timedelta(minutes=15)
+        end = start + pd.Timedelta(seconds=int(chunk_span_steps * step * 1.5))
+        calls = []
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [(last_sample.isoformat(), 7.0)])]}, calls
+        )
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        self.assertGreaterEqual(len(calls), 2)  # confirms chunking actually occurred
+        expected_last_bucket = end - rh.freq
+        self.assertEqual(df.index.max(), expected_last_bucket)
+        self.assertTrue((df["sensor.sensor_a"] == 7.0).all())
+        self.assertFalse(df["sensor.sensor_a"].isna().any())
+
+    async def test_vm_fill_previous_dense_sensor_unchanged(self):
+        """A dense sensor (a sample at every bucket already) is value-for-value unchanged
+        by the terminal-fill fix: the reindex extension is a no-op when there is no gap."""
+        rh = self._make_vm_rh()
+        points = [
+            (f"2023-04-01T{hour:02d}:{minute:02d}:00Z", float(hour * 2 + minute / 30))
+            for hour in range(2, 4)
+            for minute in (0, 30)
+        ]
+        side_effect = self._vm_query_side_effect({"dense_sensor": [("W_value", points)]})
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.dense_sensor", start, end)
+        expected = [float(h * 2 + m / 30) for h, m in [(2, 0), (2, 30), (3, 0), (3, 30)]]
+        self.assertEqual(df["sensor.dense_sensor"].tolist(), expected)
+        self.assertFalse(df["sensor.dense_sensor"].isna().any())
+
+    async def test_get_data_victoriametrics_expression_terminal_fill(self):
+        """End-to-end: an arithmetic expression built over VM-retrieved entities receives
+        the corrected terminal-filled series, not a truncated-then-NaN tail."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "power_a": [("W_value", [("2023-04-01T10:00:00Z", 1500.0)])],
+                "power_b": [("kW_value", [("2023-04-01T10:00:00Z", 0.5)])],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        expression = "{{'sensor.power_a' - 'sensor.power_b' * 1000}}"
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            self.assertTrue(await rh.get_data(days_list, [expression]))
+        df = rh.df_final
+        # Held through the last bucket of the day (23:30), not just at the 10:00 sample
+        self.assertFalse(df[expression].isna().any())
+        self.assertAlmostEqual(df.loc["2023-04-01 23:30:00+00:00"][expression], 1000.0)
 
     # Test publish data
     async def test_publish_data(self):
@@ -1701,6 +2408,28 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             # _get_session should have been called 3 times (once per post_data)
             # but it returns the same session each time
             self.assertEqual(mock_get_session.call_count, 3)
+
+    async def test_post_scalar_sensor_numpy_values(self):
+        """Test that post_scalar_sensor serialises numpy scalars (#1131)."""
+        self.rh.get_data_from_file = False
+
+        with patch.object(self.rh, "_get_session") as mock_get_session:
+            mock_session = MagicMock()
+            mock_response = AsyncMock()
+            mock_response.ok = True
+            mock_session.post.return_value.__aenter__.return_value = mock_response
+            mock_get_session.return_value = mock_session
+
+            posted = await self.rh.post_scalar_sensor(
+                "sensor.battery_identified_capacity",
+                np.float64(9.8765),
+                {"ci_low": np.float64(9.5), "ci_high": np.float64(10.25)},
+            )
+
+        self.assertTrue(posted)
+        body = orjson.loads(mock_session.post.call_args.kwargs["data"])
+        self.assertEqual(body["state"], 9.8765)
+        self.assertEqual(body["attributes"], {"ci_low": 9.5, "ci_high": 10.25})
 
     async def test_session_close(self):
         """Test that close() properly closes the session."""

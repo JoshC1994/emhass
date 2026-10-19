@@ -34,6 +34,7 @@ These parameters define the basic thermal battery system:
     * Radiator systems: typically 50-70°C
     * Lower temperatures = better heat pump efficiency
     * Example: `35.0` for underfloor heating
+    * Note: this drives the COP only - it is not enforced as a physical ceiling. To stop the optimiser heating the tank above the supply temperature, keep `max_temperatures` at or below it. In a [heat_topology](heat_topology.md), set the source's `max_supply_temperature` instead.
 
 * **volume**: Volume of the thermal storage medium in m³.
     * For underfloor heating: concrete slab volume (floor area × screed thickness)
@@ -125,6 +126,8 @@ For multi-source storage, the [heat topology graph model](heat_topology.md) can 
 ### Heating demand calculation
 
 EMHASS needs to know how much heat your building requires. There are two methods to calculate this, and EMHASS automatically selects the appropriate method based on which parameters you provide.
+
+A thermal battery needs at least one demand model: the physics keys below (Method 1), `specific_heating_demand` + `area` (Method 2), or a `draw_off_demand` profile (see Hot water tank mode). If none is configured, EMHASS stops with an error that names the three options.
 
 #### Method 1: Physics-based (recommended)
 
@@ -243,10 +246,19 @@ The temperature dynamics in hot water tank mode:
 
 ```
 conversion = 3600 / (density * heat_capacity * volume)
+thermal_loss_energy = thermal_loss * dt   # kW rate -> kWh removed this timestep
 
 predicted_temp[t+1] = predicted_temp[t]
-    + conversion * (cop[t] * p_deferrable[t] / 1000 * dt - draw_off_demand[t] - thermal_loss)
+    + conversion * (cop[t] * p_deferrable[t] / 1000 * dt - draw_off_demand[t] - thermal_loss_energy)
 ```
+
+`thermal_loss` is configured and documented as a constant **kW** rate. `draw_off_demand[t]`
+and the heater term are already **kWh** for that timestep, so EMHASS multiplies
+`thermal_loss` by the timestep duration `dt` (in hours) internally before it enters the
+balance. You always supply `thermal_loss` in kW regardless of your configured timestep —
+do not pre-scale it. A 5-minute timestep then removes 1/12th of the standby-loss energy
+that a 60-minute timestep removes; at exactly 60 minutes the result is numerically
+identical to earlier EMHASS versions (`kW × 1 h = kWh`).
 
 ### Weather-compensated minimum temperature (radiator emission floor)
 
@@ -254,7 +266,7 @@ For radiator-based heating systems, the buffer / storage temperature must stay a
 
 Set `min_temperature_curve` to make the floor track outdoor temperature via the same linear law as `heating_curve`:
 
-* **min_temperature_curve**: Dict describing the weather-compensated minimum: `T_min = clip(offset - slope * T_outdoor, min_supply, max_supply)`. When present, the per-slot effective minimum is `max(static_min_temperatures[t], curve_min[t])` so any static absolute floor still wins if it's higher.
+* **min_temperature_curve**: Dict describing the weather-compensated minimum: `T_min = clip(offset - slope * T_outdoor, min_supply, max_supply)`. When present, the per-slot effective minimum is `max(static_min_temperatures[t], curve_min[t])` so any static absolute floor still wins if it's higher. For a storage in `shared_thermal_tanks` or `heat_topology`, a `null` entry in `min_temperatures` means "no static floor for this slot": the curve floor alone applies there. A standalone `thermal_battery` load does not read `min_temperature_curve`; use a heat topology storage for a weather-compensated floor.
     * `slope`, `offset`: same form as the source's heating curve.
     * `min_supply`: Absolute floor in °C, never below this regardless of mild weather. Choose this as the buffer T below which your radiators cannot deliver useful heat (typically 28-30 °C).
     * `max_supply`: Upper bound on the dynamic floor (not the tank max - that's still `max_temperatures`).
@@ -269,7 +281,7 @@ For underfloor / slab systems the same idea applies but with a lower band (e.g.,
 
 ### Soft constraints (desired temperature / overshoot)
 
-By default, `min_temperatures` and `max_temperatures` are enforced as hard constraints — the optimizer must keep the storage temperature strictly within bounds. You can optionally add soft constraints using desired temperatures and overshoot detection, following the same pattern as `thermal_config`.
+By default, `min_temperatures` and `max_temperatures` are enforced as hard constraints — the optimizer must keep the storage temperature strictly within bounds. There is one exception: when free gains alone carry the storage past its maximum with the heat source off (solar gain, or an outdoor temperature above the storage), no plan can keep that maximum. For such a run the maximum is priced instead of making the optimization infeasible, and the log says so; the heat source does not heat into the excess. A cooling storage (`sense: cool`) mirrors this for its minimum. You can optionally add soft constraints using desired temperatures and overshoot detection, following the same pattern as `thermal_config`.
 
 When configured, the optimizer penalizes deviations from the desired temperature and suppresses heating when the storage temperature overshoots:
 
@@ -892,6 +904,12 @@ Loss = thermal_loss  (constant, not dependent on outdoor temperature)
 ```
 
 This is appropriate because a tank sits indoors at roughly constant ambient temperature.
+
+In both modes `Loss` above is a **kW** magnitude. EMHASS converts it to the energy removed
+over one timestep (`thermal_loss_energy = Loss × dt`, `dt` in hours) before subtracting it in
+the temperature balance, exactly as shown in the hot-water-tank dynamics equation earlier.
+This keeps the inferred continuous standby-loss *rate* equal to the configured kW value at
+any timestep length; `draw_off_demand` stays in kWh per timestep and needs no conversion.
 
 ### 3. Heating demand / draw-off demand
 

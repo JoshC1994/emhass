@@ -33,6 +33,7 @@ from emhass.command_line import (
     naive_mpc_optim,
     perfect_forecast_optim,
     publish_data,
+    pv_bias_calibration,
     regressor_model_fit,
     regressor_model_predict,
     set_input_data_dict,
@@ -40,15 +41,19 @@ from emhass.command_line import (
 )
 from emhass.connection_manager import close_global_connection, get_websocket_client, is_connected
 from emhass.utils import (
+    HEAT_TOPOLOGY_KEYS,
+    SocFractionError,
     build_config,
     build_legacy_config_params,
     build_params,
     build_secrets,
+    compile_heat_topology,
     get_injection_dict,
     get_injection_dict_forecast_calibration,
     get_injection_dict_forecast_model_fit,
     get_injection_dict_forecast_model_tune,
     get_keys_to_mask,
+    inverter_power_curve_faults,
     param_to_config,
 )
 
@@ -441,6 +446,54 @@ async def parameter_set():
     if len(request_data) == 0:
         return await make_response(["failed to retrieve config json"], 400)
 
+    # Validate heat_topology at save time instead of at the next optimization
+    # run: the compiler's ValueError names the offending field, so surface it
+    # in the UI alert now rather than failing an unattended run later.
+    heat_topology = request_data.get("heat_topology")
+    # An empty text box arrives as null, "", "null" or {} and means "no
+    # topology". Anything else that is not an object (a list, a JSON topology
+    # quoted as a string) would be saved and then silently ignored at run time.
+    if heat_topology not in (None, "", "null") and not isinstance(heat_topology, dict):
+        app.logger.warning("Rejected config save: heat_topology is not an object")
+        return await make_response(
+            [
+                "heat_topology is invalid: it must be a JSON object, got "
+                f"{type(heat_topology).__name__}"
+            ],
+            400,
+        )
+    if isinstance(heat_topology, dict) and heat_topology:
+        # The compiler ignores keys it does not know, so a misspelled section
+        # (e.g. "source") would compile to zero loads and, in replace mode,
+        # remove the configured ones. At save time that is a typo: reject it.
+        unknown = sorted(set(heat_topology) - HEAT_TOPOLOGY_KEYS)
+        if unknown:
+            app.logger.warning("Rejected config save: heat_topology unknown keys %s", unknown)
+            return await make_response(
+                [
+                    f"heat_topology is invalid: unknown key(s) {unknown}; expected "
+                    f"{sorted(HEAT_TOPOLOGY_KEYS)}"
+                ],
+                400,
+            )
+        try:
+            # Off the event loop: a large topology must not stall other requests.
+            await asyncio.to_thread(compile_heat_topology, heat_topology)
+        except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as e:
+            # The compiler raises ValueError with a field path; the others are a
+            # backstop for malformed entries it does not check explicitly (e.g. a
+            # string where an object is expected), which would otherwise surface
+            # as an unhandled 500.
+            app.logger.warning("Rejected config save: heat_topology invalid: %s", e)
+            return await make_response([f"heat_topology is invalid: {e}"], 400)
+
+    # Reject an unusable inverter curve before anything is written: build_params would
+    # otherwise clear it (recovery for an already-persisted file), and a silent clear
+    # here would leave the user believing the curve is active.
+    curve_faults = inverter_power_curve_faults(request_data)
+    if curve_faults:
+        return await make_response(curve_faults, 400)
+
     # Format config by converting to params (format params. check if params match legacy option.json format. If so format)
     params = await build_params(emhass_conf, params_secrets, request_data, app.logger)
     if type(params) is bool and not params:
@@ -530,16 +583,34 @@ async def _handle_action_dispatch(
     Returns (response_msg, status_code).
     """
     # Actions that don't require input_data_dict or have specific flows
+    # #1128: pure caller-fed calibration has no HA/config/optimizer side
+    # effects, so it is dispatched directly from the request payload.
+    if action_name == "pv-bias-calibration":
+        action_str = " >> Performing pv-bias-calibration..."
+        logger.info(action_str)
+        try:
+            result = await pv_bias_calibration(runtimeparams, logger)
+        except (TypeError, ValueError) as exc:
+            logger.error("PV bias calibration: %s", exc)
+            return {"error": str(exc)}, 400
+        return result, 200
+
     if action_name == "weather-forecast-cache":
         action_str = " >> Performing weather forecast, try to caching result"
         logger.info(action_str)
-        await weather_forecast_cache(emhass_conf, params, runtimeparams, logger)
+        try:
+            await weather_forecast_cache(emhass_conf, params, runtimeparams, logger)
+        except SocFractionError:
+            return await grab_log(action_str), 400
         return "EMHASS >> Weather Forecast has run and results possibly cached... \n", 200
 
     if action_name == "export-influxdb-to-csv":
         action_str = " >> Exporting InfluxDB data to CSV..."
         logger.info(action_str)
-        success = await export_influxdb_to_csv(None, logger, emhass_conf, params, runtimeparams)
+        try:
+            success = await export_influxdb_to_csv(None, logger, emhass_conf, params, runtimeparams)
+        except SocFractionError:
+            return await grab_log(action_str), 400
         if success:
             return "EMHASS >> Action export-influxdb-to-csv executed successfully... \n", 200
         return await grab_log(action_str), 400
@@ -562,6 +633,10 @@ async def _handle_action_dispatch(
         action_str = f" >> Performing {action_name}..."
         logger.info(action_str)
         opt_res = await optim_actions[action_name](input_data_dict, logger)
+        # False: the action stopped before the solver, e.g. on a rejected
+        # runtime forecast (#1135); there is no plan to render.
+        if isinstance(opt_res, bool) and not opt_res:
+            return await grab_log(action_str), 400
         injection_dict = get_injection_dict(opt_res)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return f"EMHASS >> Action {action_name} executed... \n", 200
@@ -775,7 +850,11 @@ async def action_call(action_name: str):
         return await make_response(await grab_log(" >> Obtaining params: "), 400)
 
     # Check for actions that do not need input_data_dict
-    if action_name in ["weather-forecast-cache", "export-influxdb-to-csv"]:
+    if action_name in [
+        "weather-forecast-cache",
+        "export-influxdb-to-csv",
+        "pv-bias-calibration",
+    ]:
         msg, status = await _handle_action_dispatch(
             action_name, None, emhass_conf, params, runtimeparams, app.logger
         )
@@ -1023,6 +1102,7 @@ async def _initialize_connections(params: dict) -> None:
     # Initialize persistent WebSocket connection only if use_websocket is enabled
     use_websocket = params.get("retrieve_hass_conf", {}).get("use_websocket", False)
     use_influxdb = params.get("retrieve_hass_conf", {}).get("use_influxdb", False)
+    use_victoriametrics = params.get("retrieve_hass_conf", {}).get("use_victoriametrics", False)
     # Initialize persistent WebSocket connection if enabled
     if use_websocket:
         app.logger.info("WebSocket mode enabled - initializing connection...")
@@ -1042,9 +1122,14 @@ async def _initialize_connections(params: dict) -> None:
     # Log InfluxDB mode if enabled (No persistent connection init required here)
     elif use_influxdb:
         app.logger.info("InfluxDB mode enabled - using InfluxDB for data retrieval")
-    # Default to REST API if neither is enabled
+    # Same for VictoriaMetrics (plain HTTP API, no persistent connection)
+    elif use_victoriametrics:
+        app.logger.info("VictoriaMetrics mode enabled - using VictoriaMetrics for data retrieval")
+    # Default to REST API if none is enabled
     else:
-        app.logger.info("WebSocket and InfluxDB modes disabled - using REST API for data retrieval")
+        app.logger.info(
+            "WebSocket, InfluxDB and VictoriaMetrics modes disabled - using REST API for data retrieval"
+        )
 
 
 async def initialize(args: dict | None = None):

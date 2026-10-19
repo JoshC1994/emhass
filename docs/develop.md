@@ -265,6 +265,7 @@ curl -i -H 'Content-Type:application/json' -X POST -d {} http://localhost:5000/a
 curl -i -H 'Content-Type:application/json' -X POST -d {} http://localhost:5000/action/forecast-model-predict
 curl -i -H 'Content-Type:application/json' -X POST -d {} http://localhost:5000/action/forecast-model-tune
 curl -i -H 'Content-Type:application/json' -X POST -d {} http://localhost:5000/action/forecast-calibration
+curl -i -H 'Content-Type:application/json' -X POST -d '{"p10":[80,80,80],"p50":[100,100,100],"actual":[70,90,90],"target_shortfall_rate":0.10}' http://localhost:5000/action/pv-bias-calibration
 curl -i -H "Content-Type:application/json" -X POST -d  '{"csv_file": "heating_prediction.csv", "features": ["degreeday", "solar"], "target": "hour", "regression_model": "RandomForestRegression", "model_type": "heating_hours_degreeday", "timestamp": "timestamp", "date_features": ["month", "day_of_week"], "new_values": [12.79, 4.766, 1, 2] }' http://localhost:5000/action/regressor-model-fit
 curl -i -H "Content-Type:application/json" -X POST -d  '{"mlr_predict_entity_id": "sensor.mlr_predict", "mlr_predict_unit_of_measurement": "h", "mlr_predict_friendly_name": "mlr predictor", "new_values": [8.2, 7.23, 2, 6], "model_type": "heating_hours_degreeday" }' http://localhost:5000/action/regressor-model-predict
 curl -i -H 'Content-Type:application/json' -X POST -d {} http://localhost:5000/action/publish-data
@@ -324,6 +325,8 @@ To support the configuration website to generate the parameter in the list view,
 ```
 *Note: The `default_value` in this case acts (or should act) as last resort fallback if default_config.json is not found. It also acts as the default value when you append (press plus) to an array.\* parameter*
 
+*Note: a static table-valued parameter (`input: "array.array.float"` with a list `default_value`, such as `battery_charge_power_derating` or the `inverter_power_curve_*` curves) is edited in the list view as one JSON text field and saved with `JSON.parse`; the UI only checks that it is nested numeric arrays, so validate the content in Python. A nullable per-load nested array (`default_value: null`) keeps the per-load rendering.*
+
 ![Screenshot from 2024-09-09 16-45-32](https://github.com/user-attachments/assets/01e7984f-3332-4e25-8076-160f51a2e0c4)
 
 If you are only adding another option for a existing parameter, editing `param_definitions.json` file should be all you need (allowing the user to select the option from the configuration page):
@@ -342,10 +345,12 @@ If you are only adding another option for a existing parameter, editing `param_d
 },
 ```
 
-4. Update the Optimization Cache Key (`command_line.py`)
+4. Check the Optimization Cache Key (`command_line.py`)
 If your new parameter affects the mathematical structure of the optimization problem (e.g., adding constraints, changing binary variables, or adding penalty weights), it must trigger a cache miss when changed.
 
-Add your parameter to the `OptimizationCacheKey` dataclass and the `_compute_cache_key` method inside `command_line.py`:
+Usually nothing needs to be added. `_compute_cache_key` already hashes every `plant_conf` key (`plant_conf_hash`) and every `optim_conf` key (`optim_conf_structural_hash`) except those in the `plant_runtime_keys` / `optim_conf_runtime_keys` sets, which are the values updated per call without a rebuild (CVXPY Parameters, solver options, forecast-method selectors). A new structural parameter in `plant_conf` or `optim_conf` is therefore covered automatically: do NOT add a redundant field. Instead, add a test that a change to its value changes the key (see `test_curves_invalidate_the_optimization_cache_through_plant_conf_hash` in `tests/test_inverter_power_curves.py`).
+
+Add an explicit field to the `OptimizationCacheKey` dataclass and to `_compute_cache_key` only if the parameter is *not* covered by those hashes: it lives outside `plant_conf`/`optim_conf` (e.g. `retrieve_hass_conf`), is listed in a runtime-keys set but still changes the structure, or needs a canonical form first (e.g. scalar and singleton list must share one key):
 ```python
 @dataclass(frozen=True)
 class OptimizationCacheKey:
