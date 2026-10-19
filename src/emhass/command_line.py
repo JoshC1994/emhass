@@ -1766,13 +1766,12 @@ async def _identify_battery_impl(
             soc_col,
             configured_capacity_wh,
             timestep,
-            battery_id=k,
+            battery_id=None,
         )
 
         if result is None:
             logger.debug(
-                "Battery %s\nmethod=resampled fallback",
-                k,
+                "Battery\nmethod=resampled fallback",
             )
 
             result = BatteryIdentification(
@@ -1994,8 +1993,14 @@ async def _identify_battery_impl(
             soc_col,
             configured_capacity_wh,
             time_step,
+            battery_id=k,
         )
         if result is None:
+            logger.debug(
+                "Battery %d\nmethod=resampled fallback",
+                k,
+            )
+
             result = BatteryIdentification(
                 logger, time_step=time_step
             ).identify(df, power_col, soc_col, configured_capacity_wh)
