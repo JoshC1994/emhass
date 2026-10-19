@@ -2349,7 +2349,7 @@ class RetrieveHass:
                 self.logger.warning(f"Could not resample data to {self.freq}: {e}")
 
             # Forward fill missing values
-            df_final = df_final.ffill()
+            df_final = df_final.ffill(limit=3)
 
             # Set frequency for the DataFrame index
             df_final = set_df_index_freq(df_final)
