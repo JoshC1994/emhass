@@ -422,7 +422,135 @@ class BatteryIdentification:
             energy_in_wh=throughput if direction == "charge" else 0.0,
             energy_out_wh=throughput if direction == "discharge" else 0.0,
         )
+    def _segment_from_intervals(
+        self,
+        intervals: pd.DataFrame,
+    ) -> list[_Segment]:
+        """
+        Build charge/discharge segments from raw power/SoC intervals.
 
+        The input is produced by :func:`build_battery_intervals`. Each row is
+        the energy balance between two consecutive real SoC observations, with
+        power integrated from raw samples over exactly that interval.
+
+        This avoids treating a change-only recorder sample as though it
+        represented a complete resample bucket.
+        """
+        required_columns = {
+            "end",
+            "soc_start",
+            "soc_end",
+            "energy_wh",
+            "duration",
+        }
+
+        if intervals is None or intervals.empty:
+            return []
+
+        missing_columns = required_columns.difference(intervals.columns)
+        if missing_columns:
+            self.logger.debug(
+                "battery_identification: interval frame missing columns: %s",
+                sorted(missing_columns),
+            )
+            return []
+
+        segments: list[_Segment] = []
+        current_direction = ""
+        current_start: pd.Timestamp | None = None
+        current_end: pd.Timestamp | None = None
+        current_soc_start = 0.0
+        current_soc_end = 0.0
+        current_energy_wh = 0.0
+        current_duration = pd.Timedelta(0)
+
+        def _flush() -> None:
+            nonlocal current_direction
+            nonlocal current_start
+            nonlocal current_end
+            nonlocal current_soc_start
+            nonlocal current_soc_end
+            nonlocal current_energy_wh
+            nonlocal current_duration
+
+            if (
+                current_direction == ""
+                or current_start is None
+                or current_end is None
+            ):
+                return
+
+            d_soc = current_soc_end - current_soc_start
+            duration = current_end - current_start
+
+            if (
+                abs(d_soc) < MIN_SOC_SWING_PER_SEGMENT
+                or duration < MIN_SEGMENT_DURATION
+            ):
+                return
+
+            throughput = abs(current_energy_wh)
+            if throughput <= 0:
+                return
+
+            segments.append(
+                _Segment(
+                    direction=current_direction,
+                    d_soc=d_soc,
+                    throughput_wh=throughput,
+                    duration=duration,
+                    start=current_start,
+                    end=current_end,
+                    energy_in_wh=(
+                        throughput if current_direction == "charge" else 0.0
+                    ),
+                    energy_out_wh=(
+                        throughput if current_direction == "discharge" else 0.0
+                    ),
+                )
+            )
+
+            current_direction = ""
+            current_start = None
+            current_end = None
+            current_soc_start = 0.0
+            current_soc_end = 0.0
+            current_energy_wh = 0.0
+            current_duration = pd.Timedelta(0)
+
+        for start, row in intervals.iterrows():
+            soc_start = float(row["soc_start"])
+            soc_end = float(row["soc_end"])
+            energy_wh = float(row["energy_wh"])
+            row_end = pd.Timestamp(row["end"])
+            row_duration = pd.Timedelta(row["duration"])
+
+            if soc_end > soc_start:
+                row_direction = "charge"
+            elif soc_end < soc_start:
+                row_direction = "discharge"
+            else:
+                row_direction = ""
+
+            # A zero-SoC-change interval cannot establish direction. Treat it
+            # as a boundary so it cannot silently join two opposite runs.
+            if row_direction == "":
+                _flush()
+                continue
+
+            if row_direction != current_direction:
+                _flush()
+                current_direction = row_direction
+                current_start = pd.Timestamp(start)
+                current_soc_start = soc_start
+
+            current_end = row_end
+            current_soc_end = soc_end
+            current_energy_wh += energy_wh
+            current_duration += row_duration
+
+        _flush()
+        return segments
     # -- fitting --------------------------------------------------------------
     def _fit_slopes(self, segments: list[_Segment]) -> tuple[float, float, float, float, float]:
         """
