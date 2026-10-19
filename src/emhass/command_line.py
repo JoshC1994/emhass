@@ -22,7 +22,7 @@ import pandas as pd
 
 from emhass import last_run, plan_store, utils
 from emhass.battery_identification import SCHEMA_VERSION as _BATTERY_ID_SCHEMA_VERSION_V1
-from emhass.battery_identification import BatteryIdentification
+from emhass.battery_identification import BatteryIdentification, build_battery_intervals
 from emhass.forecast import Forecast
 from emhass.forecast_calibration import (
     CALIBRATION_DEFAULT_DAYS,
@@ -1564,7 +1564,78 @@ async def identify_battery(
             exc_info=True,
         )
 
+def _identify_battery_from_raw_intervals(
+    logger: logging.Logger,
+    df: pd.DataFrame,
+    power_col: str,
+    soc_col: str,
+    configured_capacity_wh: float,
+    time_step: pd.Timedelta | None,
+) -> BatteryIdentificationResult | None:
+    """
+    Attempt battery identification from raw power/SoC energy-balance intervals.
 
+    Returns a successful result only. If raw data is insufficient, interval
+    construction fails, or the interval-based fit does not pass its guardrails,
+    returns ``None`` so the caller can fall back to the existing resampled
+    identification path.
+    """
+    try:
+        power = df[power_col].dropna().sort_index()
+        soc = df[soc_col].dropna().sort_index()
+
+        # Require a meaningful amount of raw history before preferring the
+        # interval-based path. This avoids using a short or sparse window.
+        if len(power) < 50 or len(soc) < 50:
+            return None
+
+        effective_time_step = (
+            time_step if time_step is not None else pd.Timedelta(minutes=5)
+        )
+
+        max_soc_gap = max(
+            pd.Timedelta(hours=2),
+            20 * effective_time_step,
+        )
+        max_power_staleness = max(
+            pd.Timedelta(hours=1),
+            10 * effective_time_step,
+        )
+
+        intervals = build_battery_intervals(
+            power,
+            soc,
+            max_soc_gap=max_soc_gap,
+            max_power_staleness=max_power_staleness,
+        )
+
+        if intervals is None or intervals.empty:
+            return None
+
+        result = BatteryIdentification(
+            logger,
+            time_step=time_step,
+        ).identify_from_intervals(
+            intervals,
+            configured_capacity_wh,
+        )
+
+        if result.is_ok:
+            return result
+
+        logger.debug(
+            "battery_identification: interval-based fit did not pass guardrails; "
+            "falling back to resampled identification."
+        )
+        return None
+
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "battery_identification: raw-interval identification failed; "
+            "falling back to resampled identification.",
+            exc_info=exc,
+        )
+        return None
 async def _identify_battery_impl(
     logger: logging.Logger,
     optim_conf: dict,
@@ -1660,10 +1731,20 @@ async def _identify_battery_impl(
                 "history; keeping configured battery values."
             )
             return
-        configured_capacity_wh = float(plant_conf.get("battery_nominal_energy_capacity", 0) or 0)
-        result = BatteryIdentification(
-            logger, time_step=retrieve_hass_conf.get("optimization_time_step")
-        ).identify(df, power_col, soc_col, configured_capacity_wh)
+                configured_capacity_wh = float(plant_conf.get("battery_nominal_energy_capacity", 0) or 0)
+        time_step = retrieve_hass_conf.get("optimization_time_step")
+        result = _identify_battery_from_raw_intervals(
+            logger,
+            df,
+            power_col,
+            soc_col,
+            configured_capacity_wh,
+            time_step,
+        )
+        if result is None:
+            result = BatteryIdentification(
+                logger, time_step=time_step
+            ).identify(df, power_col, soc_col, configured_capacity_wh)
         for msg in result.messages:
             logger.info("Battery identification: %s", msg)
         if not result.is_ok:
@@ -1866,9 +1947,19 @@ async def _identify_battery_impl(
         configured_capacity_wh = float(
             _batt_conf_val(plant_conf.get("battery_nominal_energy_capacity", 0), k) or 0
         )
-        result = BatteryIdentification(
-            logger, time_step=retrieve_hass_conf.get("optimization_time_step")
-        ).identify(df, power_col, soc_col, configured_capacity_wh)
+        time_step = retrieve_hass_conf.get("optimization_time_step")
+        result = _identify_battery_from_raw_intervals(
+            logger,
+            df,
+            power_col,
+            soc_col,
+            configured_capacity_wh,
+            time_step,
+        )
+        if result is None:
+            result = BatteryIdentification(
+                logger, time_step=time_step
+            ).identify(df, power_col, soc_col, configured_capacity_wh)
         for msg in result.messages:
             logger.info("Battery %d identification: %s", k, msg)
         if not result.is_ok:
