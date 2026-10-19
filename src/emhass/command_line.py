@@ -22,7 +22,11 @@ import pandas as pd
 
 from emhass import last_run, plan_store, utils
 from emhass.battery_identification import SCHEMA_VERSION as _BATTERY_ID_SCHEMA_VERSION_V1
-from emhass.battery_identification import BatteryIdentification, build_battery_intervals
+from emhass.battery_identification import (
+    BatteryIdentification,
+    BatteryIdentificationResult,
+    build_battery_intervals,
+)
 from emhass.forecast import Forecast
 from emhass.forecast_calibration import (
     CALIBRATION_DEFAULT_DAYS,
