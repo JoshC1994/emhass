@@ -1723,7 +1723,7 @@ async def _identify_battery_impl(
                 "Battery identification: could not retrieve history; keeping configured battery values."
             )
             return
-                power_col = power_list[0]
+        power_col = power_list[0]
         soc_col = soc_list[0]
         if power_col not in df.columns or soc_col not in df.columns:
             logger.warning(
