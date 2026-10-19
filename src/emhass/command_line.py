@@ -1568,13 +1568,14 @@ async def identify_battery(
             exc_info=True,
         )
 
-def _identify_battery_from_raw_intervals(
+def identify_battery_from_raw_intervals(
     logger: logging.Logger,
     df: pd.DataFrame,
     power_col: str,
     soc_col: str,
     configured_capacity_wh: float,
-    time_step: pd.Timedelta | None,
+    timestep: pd.Timedelta | None = None,
+    battery_id: int | None = None,
 ) -> BatteryIdentificationResult | None:
     """
     Attempt battery identification from raw power/SoC energy-balance intervals.
@@ -1627,9 +1628,30 @@ def _identify_battery_from_raw_intervals(
         if result.is_ok:
             return result
 
+        battery_tag = (
+            f"Battery {battery_id}"
+            if battery_id is not None
+            else "Battery"
+        )
+
         logger.debug(
-            "battery_identification: interval-based fit did not pass guardrails; "
-            "falling back to resampled identification."
+            "%s\n"
+            "method=raw-interval fit\n"
+            "history_start=%s\n"
+            "history_end=%s\n"
+            "power_samples=%s\n"
+            "soc_samples=%s\n"
+            "intervals=%s\n"
+            "status=%s\n"
+            "reason=%s",
+            battery_tag,
+            power.index.min(),
+            power.index.max(),
+            len(power),
+            len(soc),
+            len(intervals),
+            result.status,
+            result.messages,
         )
         return None
 
@@ -1737,18 +1759,31 @@ async def _identify_battery_impl(
             return
         configured_capacity_wh = float(plant_conf.get("battery_nominal_energy_capacity", 0) or 0)
         time_step = retrieve_hass_conf.get("optimization_time_step")
-        result = _identify_battery_from_raw_intervals(
+       result = identify_battery_from_raw_intervals(
             logger,
             df,
             power_col,
             soc_col,
             configured_capacity_wh,
-            time_step,
+            timestep,
+            battery_id=k,
         )
+
         if result is None:
+            logger.debug(
+                "Battery %s\nmethod=resampled fallback",
+                k,
+            )
+
             result = BatteryIdentification(
-                logger, time_step=time_step
-            ).identify(df, power_col, soc_col, configured_capacity_wh)
+                logger,
+                timestep=timestep,
+            ).identify(
+                df,
+                power_col,
+                soc_col,
+                configured_capacity_wh,
+            )
         for msg in result.messages:
             logger.info("Battery identification: %s", msg)
         if not result.is_ok:
