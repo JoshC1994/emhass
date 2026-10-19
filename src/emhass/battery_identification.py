@@ -422,6 +422,7 @@ class BatteryIdentification:
             energy_in_wh=throughput if direction == "charge" else 0.0,
             energy_out_wh=throughput if direction == "discharge" else 0.0,
         )
+
     def _segment_from_intervals(
         self,
         intervals: pd.DataFrame,
@@ -551,6 +552,7 @@ class BatteryIdentification:
 
         _flush()
         return segments
+
     # -- fitting --------------------------------------------------------------
     def _fit_slopes(self, segments: list[_Segment]) -> tuple[float, float, float, float, float]:
         """
@@ -778,6 +780,213 @@ class BatteryIdentification:
                 f"from {n_chg} charge / {n_dis} discharge segments."
             )
         return result
+
+    def identify_from_intervals(
+        self,
+        intervals: pd.DataFrame,
+        configured_capacity_wh: float,
+    ) -> BatteryIdentificationResult:
+        """
+        Estimate capacity and RTE from raw power/SoC energy-balance intervals.
+
+        This uses the same slope fit, confidence checks, and physics guardrails
+        as :meth:`identify`, but derives its segments from raw power integrated
+        between consecutive real SoC observations.
+
+        :param intervals: DataFrame produced by ``build_battery_intervals``.
+        :param configured_capacity_wh: Configured nominal capacity in Wh, used
+            only for the capacity sanity bound.
+        :return: A :class:`BatteryIdentificationResult`; only ``status == "ok"``
+            should be persisted or published.
+        """
+        segments = self._segment_from_intervals(intervals)
+
+        n_chg = sum(
+            1 for segment in segments if segment.direction == "charge"
+        )
+        n_dis = sum(
+            1 for segment in segments if segment.direction == "discharge"
+        )
+
+        if n_chg < MIN_DEEP_SEGMENTS or n_dis < MIN_DEEP_SEGMENTS:
+            return BatteryIdentificationResult(
+                status="insufficient_data",
+                messages=[
+                    "Not enough deep interval-based segments to fit "
+                    f"(charge={n_chg}, discharge={n_dis}, "
+                    f"require >= {MIN_DEEP_SEGMENTS} each). "
+                    "Keeping configured battery values."
+                ],
+                n_charge_segments=n_chg,
+                n_discharge_segments=n_dis,
+            )
+
+        (
+            s_chg,
+            s_dis,
+            ts_chg,
+            ts_dis,
+            intercept,
+        ) = self._fit_slopes(segments)
+
+        result = BatteryIdentificationResult(
+            status="ok",
+            n_charge_segments=n_chg,
+            n_discharge_segments=n_dis,
+            capacity_intercept_diag=round(intercept, 3),
+        )
+
+        if not (
+            s_chg > 0
+            and s_dis > 0
+            and ts_chg > 0
+            and ts_dis > 0
+        ):
+            result.status = "rejected_sanity_check"
+            result.messages.append(
+                "Non-positive interval-based slope estimate; "
+                "keeping configured values."
+            )
+            return result
+
+        capacity_wh = 100.0 * np.sqrt(s_chg * s_dis)
+        rte = s_dis / s_chg
+        capacity_theil_sen_wh = 100.0 * np.sqrt(ts_chg * ts_dis)
+
+        result.capacity_wh = capacity_wh
+        result.capacity_theil_sen_wh = capacity_theil_sen_wh
+        result.round_trip_efficiency = round(rte, 4)
+
+        capacity_divergence = (
+            abs(capacity_wh - capacity_theil_sen_wh) / capacity_wh
+            if capacity_wh
+            else 1.0
+        )
+
+        if capacity_divergence > TLS_THEILSEN_MAX_DIVERGENCE:
+            result.status = "low_confidence"
+            result.messages.append(
+                f"TLS vs Theil-Sen capacity diverge by "
+                f"{capacity_divergence:.1%} "
+                f"(> {TLS_THEILSEN_MAX_DIVERGENCE:.0%}); "
+                "staying observe-only."
+            )
+
+        if not (0.0 < rte <= 1.0):
+            result.status = "rejected_sanity_check"
+            result.messages.append(
+                f"RTE={rte:.3f} outside (0, 1]; "
+                "keeping configured values."
+            )
+            return result
+
+        eta = float(np.sqrt(rte))
+        result.eta_symmetric = round(eta, 4)
+
+        if configured_capacity_wh > 0:
+            capacity_low = (
+                CAPACITY_SANITY_LOW * configured_capacity_wh
+            )
+            capacity_high = (
+                CAPACITY_SANITY_HIGH * configured_capacity_wh
+            )
+        else:
+            capacity_low = ABS_CAPACITY_LOW_WH
+            capacity_high = ABS_CAPACITY_HIGH_WH
+
+        if not (capacity_low <= capacity_wh <= capacity_high):
+            result.status = "rejected_sanity_check"
+            result.messages.append(
+                f"Capacity {capacity_wh / 1000:.2f} kWh outside "
+                f"[{capacity_low / 1000:.2f}, "
+                f"{capacity_high / 1000:.2f}] kWh sanity band; "
+                "keeping configured value."
+            )
+            return result
+
+        if not (
+            SQRT_RTE_LOW <= eta <= SQRT_RTE_HIGH
+        ):
+            result.status = "rejected_sanity_check"
+            result.messages.append(
+                f"One-way efficiency sqrt(RTE)={eta:.4f} outside "
+                f"[{SQRT_RTE_LOW}, {SQRT_RTE_HIGH}]; "
+                "keeping configured values."
+            )
+            return result
+
+        (
+            (cap_low, cap_high),
+            (rte_low, rte_high),
+        ) = self._bootstrap_ci(
+            segments,
+            BOOTSTRAP_N_RESAMPLES,
+        )
+
+        finite_ci = np.isfinite(cap_low) and np.isfinite(cap_high)
+
+        result.capacity_ci_low = cap_low if finite_ci else None
+        result.capacity_ci_high = cap_high if finite_ci else None
+        result.rte_ci_low = (
+            round(rte_low, 4) if np.isfinite(rte_low) else None
+        )
+        result.rte_ci_high = (
+            round(rte_high, 4) if np.isfinite(rte_high) else None
+        )
+
+        def _downgrade(message: str) -> None:
+            if result.status == "ok":
+                result.status = "low_confidence"
+            result.messages.append(message)
+
+        if not finite_ci or capacity_wh <= 0:
+            _downgrade(
+                "Bootstrap CI is undefined; staying observe-only."
+            )
+        else:
+            relative_ci = (cap_high - cap_low) / capacity_wh
+            minimum_segments = min(n_chg, n_dis)
+
+            if relative_ci > MAX_RELATIVE_CI:
+                _downgrade(
+                    f"Capacity CI width {relative_ci:.1%} exceeds "
+                    f"{MAX_RELATIVE_CI:.0%}; staying observe-only."
+                )
+            elif (
+                relative_ci < CI_IMPLAUSIBLY_TIGHT_REL
+                and minimum_segments < CI_MIN_SEGMENTS_FOR_TIGHT
+            ):
+                _downgrade(
+                    f"Capacity CI implausibly tight "
+                    f"({relative_ci:.1e}) with only "
+                    f"{minimum_segments} cycles per direction; "
+                    "staying observe-only."
+                )
+
+        rte_crosscheck, n_cycles = self._energy_balance_rte(
+            segments,
+            capacity_wh,
+        )
+
+        result.rte_crosscheck_energy_balance = (
+            None if rte_crosscheck is None
+            else round(rte_crosscheck, 4)
+        )
+        result.n_equal_soc_cycles = n_cycles
+
+        if result.status == "ok":
+            result.messages.append(
+                f"Identified capacity {capacity_wh / 1000:.2f} kWh "
+                f"(CI [{cap_low / 1000:.2f}, "
+                f"{cap_high / 1000:.2f}]) and round-trip efficiency "
+                f"{rte:.3f} (one-way sqrt {eta:.3f}) from "
+                f"{n_chg} charge / {n_dis} discharge interval-based "
+                "segments."
+            )
+
+        return result
+
+
 def build_battery_intervals(
     power: pd.Series,
     soc: pd.Series,
