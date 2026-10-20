@@ -539,6 +539,12 @@ class BatteryIdentification:
                 _flush()
                 continue
 
+            # A skipped interval leaves a gap between the previous interval's
+            # end and this one's start. Flush the run so dSoC cannot span the
+            # unobserved stretch while its energy does not.
+            if current_start is not None and pd.Timestamp(start) != current_end:
+                _flush()
+
             if row_direction != current_direction:
                 _flush()
                 current_direction = row_direction
@@ -1044,10 +1050,10 @@ def build_battery_intervals(
     if len(power) < 2 or len(soc) < 2:
         return pd.DataFrame(columns=empty_columns)
 
-    power_times = power.index.view("int64")
+    power_times = power.index.as_unit("ns").asi8
     power_values = power.to_numpy(dtype=float)
 
-    soc_times = soc.index.view("int64")
+    soc_times = soc.index.as_unit("ns").asi8
     soc_values = soc.to_numpy(dtype=float)
 
     max_gap_ns = max_soc_gap.value
@@ -1073,14 +1079,15 @@ def build_battery_intervals(
         if len(interval_power_times) == 0:
             continue
 
-        # Include power at the exact SoC interval endpoints. This avoids
-        # assuming that the first or last raw power sample coincides with the
-        # SoC observation.
+        # Hold the last known power value at each SoC interval endpoint.
+        # Change-only samples keep their value until the next change, so a
+        # step hold matches the recorder behaviour; linear interpolation
+        # would reintroduce the sampling bias this integration avoids.
         start_power = float(
-            np.interp(start_ns, power_times, power_values)
+            power_values[np.searchsorted(power_times, start_ns, side="right") - 1]
         )
         end_power = float(
-            np.interp(end_ns, power_times, power_values)
+            power_values[np.searchsorted(power_times, end_ns, side="right") - 1]
         )
 
         integration_times = np.concatenate(
@@ -1108,10 +1115,12 @@ def build_battery_intervals(
         if largest_power_gap > max_staleness_ns:
             continue
 
-        # Trapezoidal integration. Timestamps are in nanoseconds, so divide by
-        # 3.6e12 to convert W * ns to Wh.
+        # Step-hold integration: each sample's value is held until the next.
+        # Timestamps are in nanoseconds, so divide by 3.6e12 to convert
+        # W * ns to Wh.
         energy_wh = float(
-            np.trapz(integration_values, integration_times) / 3.6e12
+            np.sum(integration_values[:-1] * np.diff(integration_times))
+            / 3.6e12
         )
 
         records.append(
