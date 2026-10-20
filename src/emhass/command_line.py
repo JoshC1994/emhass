@@ -640,6 +640,7 @@ async def _retrieve_from_hass(
         # A stale battery's sensor shouldn't cost a healthy battery days it did
         # have data for; each battery's fit only reads its own two columns (#1061).
         keep_partial_days=(set_type == "battery_id"),
+        preserve_raw=(set_type == "battery_id"),
     )
     return success, days_list
 
@@ -1759,30 +1760,22 @@ async def _identify_battery_impl(
             return
         configured_capacity_wh = float(plant_conf.get("battery_nominal_energy_capacity", 0) or 0)
         time_step = retrieve_hass_conf.get("optimization_time_step")
-       result = identify_battery_from_raw_intervals(
+        result = identify_battery_from_raw_intervals(
             logger,
-            df,
+            rh.df_raw,
             power_col,
             soc_col,
             configured_capacity_wh,
-            timestep,
+            time_step,
             battery_id=None,
         )
 
         if result is None:
-            logger.debug(
-                "Battery\nmethod=resampled fallback",
+            logger.warning(
+                "Battery identification: raw-interval fit failed; keeping configured battery values."
             )
+            return
 
-            result = BatteryIdentification(
-                logger,
-                timestep=timestep,
-            ).identify(
-                df,
-                power_col,
-                soc_col,
-                configured_capacity_wh,
-            )
         for msg in result.messages:
             logger.info("Battery identification: %s", msg)
         if not result.is_ok:
@@ -1988,7 +1981,7 @@ async def _identify_battery_impl(
         time_step = retrieve_hass_conf.get("optimization_time_step")
         result = _identify_battery_from_raw_intervals(
             logger,
-            df,
+            rh.df_raw,
             power_col,
             soc_col,
             configured_capacity_wh,
@@ -1996,14 +1989,12 @@ async def _identify_battery_impl(
             battery_id=k,
         )
         if result is None:
-            logger.debug(
-                "Battery %d\nmethod=resampled fallback",
-                k,
+            logger.warning(
+                f"Battery {k} identification: raw-interval fit failed; "
+                "keeping configured battery values."
             )
+            continue
 
-            result = BatteryIdentification(
-                logger, time_step=time_step
-            ).identify(df, power_col, soc_col, configured_capacity_wh)
         for msg in result.messages:
             logger.info("Battery %d identification: %s", k, msg)
         if not result.is_ok:
