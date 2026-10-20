@@ -1595,8 +1595,8 @@ def identify_battery_from_raw_intervals(
         if len(power) < 50 or len(soc) < 50:
             return None
 
-        effective_time_step = (
-            time_step if time_step is not None else pd.Timedelta(minutes=5)
+        effective_timestep = (
+            timestep if timestep is not None else pd.Timedelta(minutes=5)
         )
 
         max_soc_gap = max(
