@@ -196,7 +196,7 @@ class OptimizationCacheKey:
     compute_curtailment: bool
     optimization_time_step_s: float | None
     delta_forecast_daily_s: float | None
-    num_time_steps: int | None
+    num_timesteps: int | None
     costfun: str
     plant_conf_hash: str
     optim_conf_structural_hash: str  # Hash of optim_conf keys that affect problem structure
@@ -229,7 +229,7 @@ class OptimizationCache:
         plant_conf: dict,
         costfun: str,
         retrieve_hass_conf: dict,
-        num_time_steps: int | None = None,
+        num_timesteps: int | None = None,
     ) -> OptimizationCacheKey:
         """
         Compute a cache key from configuration that affects optimization structure.
@@ -438,7 +438,7 @@ class OptimizationCache:
             compute_curtailment=plant_conf.get("compute_curtailment", False),
             optimization_time_step_s=to_seconds(retrieve_hass_conf.get("optimization_time_step")),
             delta_forecast_daily_s=to_seconds(optim_conf.get("delta_forecast_daily")),
-            num_time_steps=num_time_steps,
+            num_timesteps=num_timesteps,
             costfun=costfun,
             plant_conf_hash=config_hash(plant_conf, plant_runtime_keys),
             optim_conf_structural_hash=config_hash(optim_conf, optim_conf_runtime_keys),
@@ -452,7 +452,7 @@ class OptimizationCache:
         costfun: str,
         retrieve_hass_conf: dict,
         logger: logging.Logger,
-        num_time_steps: int | None = None,
+        num_timesteps: int | None = None,
     ) -> "Optimization | None":
         """
         Get cached Optimization object if configuration matches.
@@ -461,7 +461,7 @@ class OptimizationCache:
         Thread-safe via internal locking.
         """
         cache_key = cls._compute_cache_key(
-            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_time_steps
+            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_timesteps
         )
 
         with cls._lock:
@@ -505,11 +505,11 @@ class OptimizationCache:
         costfun: str,
         retrieve_hass_conf: dict,
         logger: logging.Logger,
-        num_time_steps: int | None = None,
+        num_timesteps: int | None = None,
     ) -> None:
         """Store Optimization object in cache. Thread-safe via internal locking."""
         cache_key = cls._compute_cache_key(
-            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_time_steps
+            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_timesteps
         )
         with cls._lock:
             cls._instance = opt
@@ -2521,7 +2521,7 @@ async def set_input_data_dict(
                     costfun,
                     emhass_conf,
                     logger,
-                    num_time_steps=_num_ts,
+                    num_timesteps=_num_ts,
                 )
                 # Store in cache for future warm-starts (not for shared tanks)
                 if use_optim_cache:
