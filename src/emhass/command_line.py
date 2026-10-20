@@ -194,9 +194,9 @@ class OptimizationCacheKey:
     sequence_load_running_state: tuple  # (index, current state, completed steps) per sequence load
     inverter_is_hybrid: bool
     compute_curtailment: bool
-    optimization_timestep_s: float | None
+    optimization_time_step_s: float | None
     delta_forecast_daily_s: float | None
-    num_timesteps: int | None
+    num_time_steps: int | None
     costfun: str
     plant_conf_hash: str
     optim_conf_structural_hash: str  # Hash of optim_conf keys that affect problem structure
@@ -229,7 +229,7 @@ class OptimizationCache:
         plant_conf: dict,
         costfun: str,
         retrieve_hass_conf: dict,
-        num_timesteps: int | None = None,
+        num_time_steps: int | None = None,
     ) -> OptimizationCacheKey:
         """
         Compute a cache key from configuration that affects optimization structure.
@@ -301,21 +301,21 @@ class OptimizationCache:
         optim_conf_runtime_keys = {
             # Parameterized via CVXPY Parameters
             "operating_hours_of_each_deferrable_load",
-            "operating_timesteps_of_each_deferrable_load",
-            "start_timesteps_of_each_deferrable_load",
-            "end_timesteps_of_each_deferrable_load",
+            "operating_time_steps_of_each_deferrable_load",
+            "start_time_steps_of_each_deferrable_load",
+            "end_time_steps_of_each_deferrable_load",
             "def_current_state",
             # Per-call elapsed on-time for min-on remainder (issue #952); value
             # is read via cp.Parameter so no rebuild on cache hit.
-            "def_current_on_timesteps",
+            "def_current_on_time_steps",
             # Per-call elapsed off-time for min-off remainder (#952 follow-on); value
             # is read via cp.Parameter so no rebuild on cache hit.
-            "def_current_off_timesteps",
+            "def_current_off_time_steps",
             # Per-call current power in watts (issue #605); pin value is a cp.Parameter.
             "def_current_power",
-            # Per-call completed operating timesteps today (issue #983); decrements
-            # required_timesteps + target_energy via cp.Parameter (no rebuild on cache hit).
-            "def_current_operating_timesteps",
+            # Per-call completed operating time_steps today (issue #983); decrements
+            # required_time_steps + target_energy via cp.Parameter (no rebuild on cache hit).
+            "def_current_operating_time_steps",
             "minimum_power_of_deferrable_loads",
             "cost_forecast_per_deferrable_load",
             # shared_thermal_tanks has its own structural hash field above
@@ -366,7 +366,7 @@ class OptimizationCache:
                 load_type = "standard"
             def_structure.append((i, load_type))
 
-        # Sequence loads read def_current_state and def_current_operating_timesteps
+        # Sequence loads read def_current_state and def_current_operating_time_steps
         # when the problem is built (they size the start-time variable and cut the
         # completed steps from the power sequence), so for these loads a change in
         # either value must miss the cache and rebuild the problem.
@@ -374,7 +374,7 @@ class OptimizationCache:
         if nominal_powers is None:
             nominal_powers = []
         current_states = to_tuple(optim_conf.get("def_current_state", []))
-        completed_steps = to_tuple(optim_conf.get("def_current_operating_timesteps", []))
+        completed_steps = to_tuple(optim_conf.get("def_current_operating_time_steps", []))
         sequence_load_running_state = tuple(
             (
                 i,
@@ -404,7 +404,7 @@ class OptimizationCache:
                 optim_conf.get("set_deferrable_load_as_timeseries", [])
             ),
             # Note: The following are parameterized and don't require rebuild:
-            # - start_timesteps and end_timesteps (via window masks)
+            # - start_time_steps and end_time_steps (via window masks)
             # - operating_hours_of_each_deferrable_load (via Big-M energy constraints)
             nominal_power_of_deferrable_loads=to_tuple(
                 optim_conf.get("nominal_power_of_deferrable_loads", [])
@@ -436,9 +436,9 @@ class OptimizationCache:
             sequence_load_running_state=sequence_load_running_state,
             inverter_is_hybrid=plant_conf.get("inverter_is_hybrid", False),
             compute_curtailment=plant_conf.get("compute_curtailment", False),
-            optimization_timestep_s=to_seconds(retrieve_hass_conf.get("optimization_timestep")),
+            optimization_time_step_s=to_seconds(retrieve_hass_conf.get("optimization_time_step")),
             delta_forecast_daily_s=to_seconds(optim_conf.get("delta_forecast_daily")),
-            num_timesteps=num_timesteps,
+            num_time_steps=num_time_steps,
             costfun=costfun,
             plant_conf_hash=config_hash(plant_conf, plant_runtime_keys),
             optim_conf_structural_hash=config_hash(optim_conf, optim_conf_runtime_keys),
@@ -452,7 +452,7 @@ class OptimizationCache:
         costfun: str,
         retrieve_hass_conf: dict,
         logger: logging.Logger,
-        num_timesteps: int | None = None,
+        num_time_steps: int | None = None,
     ) -> "Optimization | None":
         """
         Get cached Optimization object if configuration matches.
@@ -461,7 +461,7 @@ class OptimizationCache:
         Thread-safe via internal locking.
         """
         cache_key = cls._compute_cache_key(
-            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_timesteps
+            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_time_steps
         )
 
         with cls._lock:
@@ -505,11 +505,11 @@ class OptimizationCache:
         costfun: str,
         retrieve_hass_conf: dict,
         logger: logging.Logger,
-        num_timesteps: int | None = None,
+        num_time_steps: int | None = None,
     ) -> None:
         """Store Optimization object in cache. Thread-safe via internal locking."""
         cache_key = cls._compute_cache_key(
-            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_timesteps
+            optim_conf, plant_conf, costfun, retrieve_hass_conf, num_time_steps
         )
         with cls._lock:
             cls._instance = opt
@@ -777,7 +777,7 @@ async def _retrieve_and_fit_pv_model(
     )
     if not success:
         return False
-    # Best-effort retrieval of the curtailment history: timesteps where PV was
+    # Best-effort retrieval of the curtailment history: time_steps where PV was
     # curtailed must not train the adjustment model (issue #1026). Any failure
     # here (no history, entity missing) falls back to unfiltered training.
     curtailment_series = None
@@ -1575,7 +1575,7 @@ def identify_battery_from_raw_intervals(
     power_col: str,
     soc_col: str,
     configured_capacity_wh: float,
-    timestep: pd.Timedelta | None = None,
+    time_step: pd.Timedelta | None = None,
     battery_id: int | None = None,
 ) -> BatteryIdentificationResult | None:
     """
@@ -1595,17 +1595,17 @@ def identify_battery_from_raw_intervals(
         if len(power) < 50 or len(soc) < 50:
             return None
 
-        effective_timestep = (
-            timestep if timestep is not None else pd.Timedelta(minutes=5)
+        effective_time_step = (
+            time_step if time_step is not None else pd.Timedelta(minutes=5)
         )
 
         max_soc_gap = max(
             pd.Timedelta(hours=2),
-            20 * effective_timestep,
+            20 * effective_time_step,
         )
         max_power_staleness = max(
             pd.Timedelta(hours=1),
-            10 * effective_timestep,
+            10 * effective_time_step,
         )
 
         intervals = build_battery_intervals(
@@ -1759,7 +1759,7 @@ async def _identify_battery_impl(
             )
             return
         configured_capacity_wh = float(plant_conf.get("battery_nominal_energy_capacity", 0) or 0)
-        timestep = retrieve_hass_conf.get("optimization_timestep")
+        timestep = retrieve_hass_conf.get("optimization_time_step")
         result = identify_battery_from_raw_intervals(
             logger,
             rh.df_raw,
@@ -1978,7 +1978,7 @@ async def _identify_battery_impl(
         configured_capacity_wh = float(
             _batt_conf_val(plant_conf.get("battery_nominal_energy_capacity", 0), k) or 0
         )
-        timestep = retrieve_hass_conf.get("optimization_timestep")
+        timestep = retrieve_hass_conf.get("optimization_time_step")
         result = identify_battery_from_raw_intervals(
             logger,
             rh.df_raw,
@@ -2137,8 +2137,8 @@ def _apply_df_freq_horizon(
 ) -> pd.DataFrame:
     """Helper to apply frequency adjustment and prediction horizon slicing."""
     # Handle Frequency
-    if retrieve_hass_conf.get("optimization_timestep"):
-        step = retrieve_hass_conf["optimization_timestep"]
+    if retrieve_hass_conf.get("optimization_time_step"):
+        step = retrieve_hass_conf["optimization_time_step"]
         if not isinstance(step, pd._libs.tslibs.timedeltas.Timedelta):
             step = pd.to_timedelta(step, "minute")
         df = df[~df.index.duplicated(keep="last")]
@@ -2428,7 +2428,7 @@ async def set_input_data_dict(
     rh = RetrieveHass(
         retrieve_hass_conf["hass_url"],
         retrieve_hass_conf["long_lived_token"],
-        retrieve_hass_conf["optimization_timestep"],
+        retrieve_hass_conf["optimization_time_step"],
         retrieve_hass_conf["time_zone"],
         params,
         emhass_conf,
@@ -2521,7 +2521,7 @@ async def set_input_data_dict(
                     costfun,
                     emhass_conf,
                     logger,
-                    num_timesteps=_num_ts,
+                    num_time_steps=_num_ts,
                 )
                 # Store in cache for future warm-starts (not for shared tanks)
                 if use_optim_cache:
@@ -3060,7 +3060,7 @@ async def naive_mpc_optim(
     soc_init = input_data_dict["params"]["passed_data"]["soc_init"]
     soc_final = input_data_dict["params"]["passed_data"]["soc_final"]
     soc_target = input_data_dict["params"]["passed_data"].get("soc_target", None)
-    soc_target_timestep = input_data_dict["params"]["passed_data"].get("soc_target_timestep", None)
+    soc_target_time_step = input_data_dict["params"]["passed_data"].get("soc_target_time_step", None)
     current_period_peak = input_data_dict["params"]["passed_data"].get("current_period_peak", None)
     capacity_charge_window = input_data_dict["params"]["passed_data"].get(
         "capacity_charge_window", None
@@ -3074,14 +3074,14 @@ async def naive_mpc_optim(
     def_total_hours = input_data_dict["params"]["optim_conf"].get(
         "operating_hours_of_each_deferrable_load", None
     )
-    def_total_timestep = input_data_dict["params"]["optim_conf"].get(
-        "operating_timesteps_of_each_deferrable_load", None
+    def_total_time_step = input_data_dict["params"]["optim_conf"].get(
+        "operating_time_steps_of_each_deferrable_load", None
     )
-    def_start_timestep = input_data_dict["params"]["optim_conf"].get(
-        "start_timesteps_of_each_deferrable_load"
+    def_start_time_step = input_data_dict["params"]["optim_conf"].get(
+        "start_time_steps_of_each_deferrable_load"
     )
-    def_end_timestep = input_data_dict["params"]["optim_conf"].get(
-        "end_timesteps_of_each_deferrable_load"
+    def_end_time_step = input_data_dict["params"]["optim_conf"].get(
+        "end_time_steps_of_each_deferrable_load"
     )
     with stage_timer(input_data_dict["stage_times"], "optim_solve", logger):
         opt_res_naive_mpc = input_data_dict["opt"].perform_naive_mpc_optim(
@@ -3092,15 +3092,15 @@ async def naive_mpc_optim(
             soc_init,
             soc_final,
             soc_target=soc_target,
-            soc_target_timestep=soc_target_timestep,
+            soc_target_time_step=soc_target_time_step,
             current_period_peak=current_period_peak,
             capacity_charge_window=capacity_charge_window,
             capacity_charge_consideration=capacity_charge_consideration,
             capacity_charge_current_interval_history=capacity_charge_current_interval_history,
             def_total_hours=def_total_hours,
-            def_total_timestep=def_total_timestep,
-            def_start_timestep=def_start_timestep,
-            def_end_timestep=def_end_timestep,
+            def_total_time_step=def_total_time_step,
+            def_start_time_step=def_start_time_step,
+            def_end_time_step=def_end_time_step,
             stage_times=input_data_dict["stage_times"],
         )
     # Save CSV file for publish_data
@@ -3672,7 +3672,7 @@ async def export_influxdb_to_csv(
         rh = RetrieveHass(
             retrieve_hass_conf["hass_url"],
             retrieve_hass_conf["long_lived_token"],
-            retrieve_hass_conf["optimization_timestep"],
+            retrieve_hass_conf["optimization_time_step"],
             retrieve_hass_conf["time_zone"],
             params,
             emhass_conf,
@@ -3826,8 +3826,8 @@ def _load_opt_res_latest(
         input_data_dict["retrieve_hass_conf"]["time_zone"]
     )
     # Infer the index frequency from the saved data itself rather than asserting
-    # the current request's optimization_timestep onto it (#976): the CSV may
-    # have been written by a run with a different runtime optimization_timestep,
+    # the current request's optimization_time_step onto it (#976): the CSV may
+    # have been written by a run with a different runtime optimization_time_step,
     # and pandas raises on the mismatch. The publish path only needs the
     # timestamps for nearest-index matching. Frames with fewer than 2 rows carry
     # no inferable spacing, so leave their freq unset.
@@ -3986,7 +3986,7 @@ async def _publish_deferrable_states(
 
     Gated by the ``publish_deferrable_load_states`` option (default off, so the
     zero-config behaviour is unchanged). For each deferrable load this posts a
-    string-state sensor ('on'/'off'/'variable') for the current timestep plus the
+    string-state sensor ('on'/'off'/'variable') for the current time_step plus the
     full optimized plan as a 'schedule' attribute — a generic, glue-agnostic
     command surface that automations can act on directly.
     """
@@ -4376,7 +4376,7 @@ async def continual_publish(
     """
     logger.info("Continual publish thread service started")
     freq = input_data_dict["retrieve_hass_conf"].get(
-        "optimization_timestep", pd.to_timedelta(1, "minutes")
+        "optimization_time_step", pd.to_timedelta(1, "minutes")
     )
     while True:
         # Sleep for x seconds (using current time as a reference for time left)
@@ -4432,8 +4432,8 @@ async def _publish_and_update_freq(input_data_dict, entity_path, logger, current
             content = await file.read()
             metadata = orjson.loads(content)
             # Check if freq should be shorter
-            if metadata.get("lowest_timestep") is not None:
-                return pd.to_timedelta(metadata["lowest_timestep"], "minutes")
+            if metadata.get("lowest_time_step") is not None:
+                return pd.to_timedelta(metadata["lowest_time_step"], "minutes")
     return current_freq
 
 
@@ -4482,7 +4482,7 @@ async def publish_json(
         input_data_dict["retrieve_hass_conf"]["time_zone"]
     )
     entity_data.index.freq = pd.to_timedelta(
-        int(metadata[entity_id]["optimization_timestep"]), "minutes"
+        int(metadata[entity_id]["optimization_time_step"]), "minutes"
     )
     # Calculate the current state value
     if input_data_dict["retrieve_hass_conf"]["method_ts_round"] == "nearest":
