@@ -695,6 +695,7 @@ class RetrieveHass:
         self,
         days_list: pd.date_range,
         var_list: list[str],
+        preserve_raw: bool = False,
     ) -> bool:
         r"""
         Retrieve the actual data from hass.
@@ -740,6 +741,11 @@ class RetrieveHass:
                 ),
                 timeout=30.0,
             )
+
+            if preserve_raw:
+                self.df_raw = self._convert_statistics_to_dataframe(
+                    stats_data, var_list, preserve_raw=True
+                )
 
             # Convert statistics data to DataFrame
             self.df_final = self._convert_statistics_to_dataframe(stats_data, var_list)
