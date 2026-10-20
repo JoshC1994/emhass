@@ -475,42 +475,38 @@ class BatteryIdentification:
             nonlocal current_duration
 
             if (
-                current_direction == ""
-                or current_start is None
-                or current_end is None
+                current_direction != ""
+                and current_start is not None
+                and current_end is not None
             ):
-                return
+                d_soc = current_soc_end - current_soc_start
+                duration = current_end - current_start
+                throughput = abs(current_energy_wh)
 
-            d_soc = current_soc_end - current_soc_start
-            duration = current_end - current_start
+                if (
+                    abs(d_soc) >= MIN_SOC_SWING_PER_SEGMENT
+                    and duration >= MIN_SEGMENT_DURATION
+                    and throughput > 0
+                ):
+                    segments.append(
+                        _Segment(
+                            direction=current_direction,
+                            d_soc=d_soc,
+                            throughput_wh=throughput,
+                            duration=duration,
+                            start=current_start,
+                            end=current_end,
+                            energy_in_wh=(
+                                throughput if current_direction == "charge" else 0.0
+                            ),
+                            energy_out_wh=(
+                                throughput if current_direction == "discharge" else 0.0
+                            ),
+                        )
+                    )
 
-            if (
-                abs(d_soc) < MIN_SOC_SWING_PER_SEGMENT
-                or duration < MIN_SEGMENT_DURATION
-            ):
-                return
-
-            throughput = abs(current_energy_wh)
-            if throughput <= 0:
-                return
-
-            segments.append(
-                _Segment(
-                    direction=current_direction,
-                    d_soc=d_soc,
-                    throughput_wh=throughput,
-                    duration=duration,
-                    start=current_start,
-                    end=current_end,
-                    energy_in_wh=(
-                        throughput if current_direction == "charge" else 0.0
-                    ),
-                    energy_out_wh=(
-                        throughput if current_direction == "discharge" else 0.0
-                    ),
-                )
-            )
-
+            # Reset unconditionally: a rejected segment must never leave stale
+            # state for a later same-direction interval to inherit across a gap.
             current_direction = ""
             current_start = None
             current_end = None
@@ -1003,62 +999,46 @@ def build_battery_intervals(
     Build energy-balance intervals from raw power and SoC observations.
 
     Each interval runs between two consecutive real SoC observations. Power is
-    integrated from raw power samples over exactly that interval.
-
-    This avoids the bias introduced by averaging sparse, change-only recorder
-    samples into fixed resample buckets before estimating battery throughput.
+    integrated from raw samples over exactly that interval using a step-hold
+    (last-known-value) rule, matching change-only recorder behaviour.
 
     Parameters
     ----------
-    power:
+    power : pd.Series
         Raw signed battery power samples, indexed by timestamp.
-        Positive values are treated as charging after sign auto-detection.
-    soc:
+    soc : pd.Series
         Raw battery state-of-charge samples, indexed by timestamp.
-    max_soc_gap:
-        Maximum permitted interval between two real SoC observations. Longer
-        intervals are treated as recorder/data outages and are not bridged.
-    max_power_staleness:
-        Maximum permitted gap between real power observations inside an
-        interval. Longer power silences are treated as outages.
+    max_soc_gap : pd.Timedelta
+        Maximum permitted interval between two real SoC observations.
+    max_power_staleness : pd.Timedelta
+        Maximum permitted gap between real power observations inside an interval.
 
     Returns
     -------
-    pandas.DataFrame
-        DataFrame indexed by interval start time, with columns:
-
-        - ``end``: interval end timestamp
-        - ``soc_start``: SoC at interval start
-        - ``soc_end``: SoC at interval end
-        - ``energy_wh``: signed integrated battery energy, Wh
-        - ``duration``: interval duration
+    pd.DataFrame
+        Indexed by interval start time, with columns:
+        end, soc_start, soc_end, energy_wh, duration.
     """
-    empty_columns = [
-        "end",
-        "soc_start",
-        "soc_end",
-        "energy_wh",
-        "duration",
-    ]
-
+    empty = pd.DataFrame(
+        columns=["end", "soc_start", "soc_end", "energy_wh", "duration"]
+    )
     if power is None or soc is None or power.empty or soc.empty:
-        return pd.DataFrame(columns=empty_columns)
+        return empty
 
     power = power.dropna().sort_index()
     soc = soc.dropna().sort_index()
-
     if len(power) < 2 or len(soc) < 2:
-        return pd.DataFrame(columns=empty_columns)
+        return empty
 
+    # Normalise to nanoseconds: asi8 counts in the index's own resolution
+    # (microseconds on pandas 3), while Timedelta.value is always nanoseconds.
     power_times = power.index.as_unit("ns").asi8
     power_values = power.to_numpy(dtype=float)
-
     soc_times = soc.index.as_unit("ns").asi8
     soc_values = soc.to_numpy(dtype=float)
 
     max_gap_ns = max_soc_gap.value
     max_staleness_ns = max_power_staleness.value
-
     records: list[dict[str, object]] = []
 
     for i in range(len(soc) - 1):
@@ -1066,23 +1046,12 @@ def build_battery_intervals(
         end_ns = int(soc_times[i + 1])
         gap_ns = end_ns - start_ns
 
-        # A long interval between real SoC observations is a recorder or data
-        # outage. The battery state across it is unobserved, so it must not be
-        # bridged or used to manufacture throughput.
+        # Reject intervals that span a real SoC outage.
         if gap_ns > max_gap_ns:
             continue
 
-        power_mask = (power_times >= start_ns) & (power_times <= end_ns)
-        interval_power_times = power_times[power_mask]
-        interval_power_values = power_values[power_mask]
-
-        if len(interval_power_times) == 0:
-            continue
-
-        # Hold the last known power value at each SoC interval endpoint.
-        # Change-only samples keep their value until the next change, so a
-        # step hold matches the recorder behaviour; linear interpolation
-        # would reintroduce the sampling bias this integration avoids.
+        # Hold the last known power value at each endpoint (step-hold),
+        # matching change-only recorder behaviour rather than linear interpolation.
         start_power = float(
             power_values[np.searchsorted(power_times, start_ns, side="right") - 1]
         )
@@ -1090,37 +1059,31 @@ def build_battery_intervals(
             power_values[np.searchsorted(power_times, end_ns, side="right") - 1]
         )
 
-        integration_times = np.concatenate(
-            (
-                np.array([start_ns]),
-                interval_power_times,
-                np.array([end_ns]),
-            )
-        )
-        integration_values = np.concatenate(
-            (
-                np.array([start_power]),
-                interval_power_values,
-                np.array([end_power]),
-            )
-        )
+        power_mask = (power_times >= start_ns) & (power_times <= end_ns)
+        interval_power_times = power_times[power_mask]
+        interval_power_values = power_values[power_mask]
+        if len(interval_power_times) == 0:
+            continue
 
-        # Reject the interval if power was stale for too long. This prevents a
-        # held non-zero value from fabricating energy across an outage.
+        # Reject intervals where power went silent for too long.
         if len(interval_power_times) >= 2:
             largest_power_gap = int(np.max(np.diff(interval_power_times)))
         else:
             largest_power_gap = gap_ns
-
         if largest_power_gap > max_staleness_ns:
             continue
 
-        # Step-hold integration: each sample's value is held until the next.
-        # Timestamps are in nanoseconds, so divide by 3.6e12 to convert
-        # W * ns to Wh.
+        integration_times = np.concatenate(
+            [np.array([start_ns]), interval_power_times, np.array([end_ns])]
+        )
+        integration_values = np.concatenate(
+            [np.array([start_power]), interval_power_values, np.array([end_power])]
+        )
+
+        # Step-hold integral: each sample's value is held until the next.
+        # Timestamps are nanoseconds; divide by 3.6e12 to get Wh.
         energy_wh = float(
-            np.sum(integration_values[:-1] * np.diff(integration_times))
-            / 3.6e12
+            np.sum(integration_values[:-1] * np.diff(integration_times)) / 3.6e12
         )
 
         records.append(
@@ -1134,12 +1097,7 @@ def build_battery_intervals(
         )
 
     if not records:
-        return pd.DataFrame(columns=empty_columns)
+        return empty
 
-    interval_starts = [
-        record["end"] - record["duration"] for record in records
-    ]
-
-    return pd.DataFrame(records).set_index(
-        pd.DatetimeIndex(interval_starts)
-    )
+    interval_starts = [r["end"] - r["duration"] for r in records]
+    return pd.DataFrame(records).set_index(pd.DatetimeIndex(interval_starts))
