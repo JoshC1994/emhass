@@ -130,6 +130,7 @@ class RetrieveHass:
         self.logger = logger
         self.get_data_from_file = get_data_from_file
         self.var_list = []
+        self.df_raw = None
         # #1077: opt-in control for attaching the full optimisation horizon to
         # Home Assistant state attributes. Default (unset) keeps the historical
         # behaviour; setting retrieve_hass_conf.publish_horizon_attributes to
@@ -345,6 +346,7 @@ class RetrieveHass:
         significant_changes_only: bool | None = False,
         test_url: str | None = "empty",
         keep_partial_days: bool = False,
+        preserve_raw: bool = False,
     ) -> None:
         r"""
         Retrieve the actual data from hass.
@@ -372,20 +374,29 @@ class RetrieveHass:
             sensor doesn't cost other sensors days they did have data for. \
             Defaults to False
         :type keep_partial_days: bool, optional
+        :param preserve_raw: Also retain the native-resolution samples for each
+        sensor in var_list, before resampling to the optimisation grid. Used by
+        battery self-identification to integrate raw power between real SoC
+        observations. Defaults to False
+        :type preserve_raw: bool, optional
         :return: The DataFrame populated with the retrieved data from hass
         :rtype: pandas.DataFrame
         """
         # Use InfluxDB if configured (Prioritize over WebSocket/REST for history)
         if self.use_influxdb:
-            return self.get_data_influxdb(days_list, var_list)
+            return self.get_data_influxdb(days_list, var_list, preserve_raw=preserve_raw)
 
         # Use VictoriaMetrics if configured (same role as InfluxDB: long history for ML)
         if self.use_victoriametrics:
-            return await self.get_data_victoriametrics(days_list, var_list)
+            return await self.get_data_victoriametrics(
+                days_list, var_list, preserve_raw=preserve_raw
+            )
 
         # Use WebSockets if configured, otherwise use Home Assistant REST API
         if self.use_websocket:
-            success = await self.get_data_websocket(days_list, var_list)
+            success = await self.get_data_websocket(
+                days_list, var_list, preserve_raw=preserve_raw
+            )
             if not success:
                 self.logger.warning("WebSocket data retrieval failed, falling back to REST API")
                 # Fall back to REST API if websocket fails
@@ -396,6 +407,7 @@ class RetrieveHass:
                     significant_changes_only,
                     test_url,
                     keep_partial_days=keep_partial_days,
+                    preserve_raw=preserve_raw,
                 )
             return success
 
@@ -407,6 +419,7 @@ class RetrieveHass:
             significant_changes_only,
             test_url,
             keep_partial_days=keep_partial_days,
+            preserve_raw=preserve_raw,
         )
 
     def _build_history_url(
@@ -492,7 +505,13 @@ class RetrieveHass:
             return None
 
     def _process_history_dataframe(
-        self, data: list, var: str, day: pd.Timestamp, is_first_day: bool, is_last_day: bool
+        self,
+        data: list,
+        var: str,
+        day: pd.Timestamp,
+        is_first_day: bool,
+        is_last_day: bool,
+        preserve_raw: bool = False,
     ) -> pd.DataFrame | None:
         """Helper to convert raw data to a resampled DataFrame."""
         df_raw = pd.DataFrame.from_dict(data)
@@ -523,6 +542,8 @@ class RetrieveHass:
             .rename(columns={"state": var})
         )
         df_tp.set_index(pd.to_datetime(df_raw["last_changed"], format="ISO8601"), inplace=True)
+        if preserve_raw:
+            self._raw_day_frames.append(df_tp.copy())
         df_tp = df_tp.resample(self.freq).mean()
         return df_tp
 
@@ -534,6 +555,7 @@ class RetrieveHass:
         significant_changes_only: bool | None = False,
         test_url: str | None = "empty",
         keep_partial_days: bool = False,
+        preserve_raw: bool = False,
     ) -> None:
         """Internal method to handle REST API data retrieval."""
         self.logger.info("Retrieve hass get data method initiated...")
@@ -558,6 +580,7 @@ class RetrieveHass:
         }
         var_list = [var for var in var_list if var != ""]
         self.df_final = pd.DataFrame()
+        self._raw_day_frames = []
 
         days_skipped = 0
         # Concurrent fetch: run all (day, var) HTTP requests in parallel, bounded
@@ -609,6 +632,7 @@ class RetrieveHass:
                             day,
                             is_first_day=(day_idx == 0),
                             is_last_day=(day_idx == len(days_list) - 1),
+                            preserve_raw=preserve_raw,
                         )
                     if df_resampled is None:
                         missing_var = True
@@ -649,6 +673,9 @@ class RetrieveHass:
                 "Check sensor names and recorder history settings."
             )
             return False
+
+        if preserve_raw and self._raw_day_frames:
+            self.df_raw = pd.concat(self._raw_day_frames)
 
         # Final Cleanup
         self.df_final = set_df_index_freq(self.df_final)
@@ -730,6 +757,7 @@ class RetrieveHass:
         self,
         days_list: pd.date_range,
         var_list: list,
+        preserve_raw: bool = False,
     ) -> bool:
         """
         Retrieve data from InfluxDB database.
@@ -850,6 +878,9 @@ class RetrieveHass:
                 f"{source} data frequency ({self.df_final.index.freq}) differs from expected ({self.freq})"
             )
 
+        if preserve_raw:
+            self.df_raw = self.df_final
+
         self.var_list = var_list
         self.logger.info(f"{source} data retrieval completed: {self.df_final.shape}")
         return True
@@ -876,6 +907,7 @@ class RetrieveHass:
         self,
         days_list: pd.date_range,
         var_list: list,
+        preserve_raw: bool = False,
     ) -> bool:
         """
         Retrieve data from a VictoriaMetrics instance.
@@ -984,7 +1016,10 @@ class RetrieveHass:
             )
             return False
 
-        return self._assemble_timeseries_source_df(sensor_dfs, var_list, "VictoriaMetrics")
+        result = self._assemble_timeseries_source_df(sensor_dfs, var_list, "VictoriaMetrics")
+        if preserve_raw:
+            self.df_raw = self.df_final
+        return result
 
     def _vm_base_url(self) -> str:
         """Base URL of the VictoriaMetrics HTTP API."""
@@ -2265,7 +2300,10 @@ class RetrieveHass:
             return False
 
     def _convert_statistics_to_dataframe(
-        self, stats_data: dict[str, Any], var_list: list[str]
+        self,
+        stats_data: dict[str, Any],
+        var_list: list[str],
+        preserve_raw: bool = False,
     ) -> pd.DataFrame:
         """Convert WebSocket statistics data to DataFrame."""
         import pandas as pd
@@ -2342,16 +2380,17 @@ class RetrieveHass:
             # Sort by index
             df_final = df_final.sort_index()
 
-            # Resample to frequency if needed
-            try:
-                df_final = df_final.resample(self.freq).mean()
-            except Exception as e:
-                self.logger.warning(f"Could not resample data to {self.freq}: {e}")
+            if not preserve_raw:
+                # Resample to frequency if needed
+                try:
+                    df_final = df_final.resample(self.freq).mean()
+                except Exception as e:
+                    self.logger.warning(f"Could not resample data to {self.freq}: {e}")
 
-            # Forward fill missing values
-            df_final = df_final.ffill(limit=3)
+                # Forward fill missing values
+                df_final = df_final.ffill(limit=3)
 
-            # Set frequency for the DataFrame index
-            df_final = set_df_index_freq(df_final)
+                # Set frequency for the DataFrame index
+                df_final = set_df_index_freq(df_final)
 
         return df_final
