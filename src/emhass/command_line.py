@@ -1601,11 +1601,11 @@ def identify_battery_from_raw_intervals(
 
         max_soc_gap = max(
             pd.Timedelta(hours=2),
-            20 * effective_time_step,
+            20 * effective_timestep,
         )
         max_power_staleness = max(
             pd.Timedelta(hours=1),
-            10 * effective_time_step,
+            10 * effective_timestep,
         )
 
         intervals = build_battery_intervals(
