@@ -640,7 +640,6 @@ async def _retrieve_from_hass(
         # A stale battery's sensor shouldn't cost a healthy battery days it did
         # have data for; each battery's fit only reads its own two columns (#1061).
         keep_partial_days=(set_type == "battery_id"),
-        preserve_raw=(set_type == "battery_id"),
     )
     return success, days_list
 
@@ -1979,7 +1978,7 @@ async def _identify_battery_impl(
             _batt_conf_val(plant_conf.get("battery_nominal_energy_capacity", 0), k) or 0
         )
         time_step = retrieve_hass_conf.get("optimization_time_step")
-        result = _identify_battery_from_raw_intervals(
+        result = identify_battery_from_raw_intervals(
             logger,
             rh.df_raw,
             power_col,
