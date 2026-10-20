@@ -640,6 +640,7 @@ async def _retrieve_from_hass(
         # A stale battery's sensor shouldn't cost a healthy battery days it did
         # have data for; each battery's fit only reads its own two columns (#1061).
         keep_partial_days=(set_type == "battery_id"),
+        preserve_raw=(set_type == "battery_id"),
     )
     return success, days_list
 
