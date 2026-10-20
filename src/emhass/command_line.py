@@ -1620,7 +1620,7 @@ def identify_battery_from_raw_intervals(
 
         result = BatteryIdentification(
             logger,
-            timestep=timestep,
+            timestep=time_step,
         ).identify_from_intervals(
             intervals,
             configured_capacity_wh,
