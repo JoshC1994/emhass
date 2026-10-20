@@ -194,7 +194,7 @@ class OptimizationCacheKey:
     sequence_load_running_state: tuple  # (index, current state, completed steps) per sequence load
     inverter_is_hybrid: bool
     compute_curtailment: bool
-    optimization_time_step_s: float | None
+    optimization_timestep_s: float | None
     delta_forecast_daily_s: float | None
     num_timesteps: int | None
     costfun: str
@@ -436,7 +436,7 @@ class OptimizationCache:
             sequence_load_running_state=sequence_load_running_state,
             inverter_is_hybrid=plant_conf.get("inverter_is_hybrid", False),
             compute_curtailment=plant_conf.get("compute_curtailment", False),
-            optimization_time_step_s=to_seconds(retrieve_hass_conf.get("optimization_time_step")),
+            optimization_timestep_s=to_seconds(retrieve_hass_conf.get("optimization_timestep")),
             delta_forecast_daily_s=to_seconds(optim_conf.get("delta_forecast_daily")),
             num_timesteps=num_timesteps,
             costfun=costfun,
@@ -1620,7 +1620,7 @@ def identify_battery_from_raw_intervals(
 
         result = BatteryIdentification(
             logger,
-            time_step=time_step,
+            timestep=timestep,
         ).identify_from_intervals(
             intervals,
             configured_capacity_wh,
@@ -1759,14 +1759,14 @@ async def _identify_battery_impl(
             )
             return
         configured_capacity_wh = float(plant_conf.get("battery_nominal_energy_capacity", 0) or 0)
-        time_step = retrieve_hass_conf.get("optimization_time_step")
+        timestep = retrieve_hass_conf.get("optimization_timestep")
         result = identify_battery_from_raw_intervals(
             logger,
             rh.df_raw,
             power_col,
             soc_col,
             configured_capacity_wh,
-            time_step,
+            timestep,
             battery_id=None,
         )
 
@@ -1978,14 +1978,14 @@ async def _identify_battery_impl(
         configured_capacity_wh = float(
             _batt_conf_val(plant_conf.get("battery_nominal_energy_capacity", 0), k) or 0
         )
-        time_step = retrieve_hass_conf.get("optimization_time_step")
+        timestep = retrieve_hass_conf.get("optimization_timestep")
         result = identify_battery_from_raw_intervals(
             logger,
             rh.df_raw,
             power_col,
             soc_col,
             configured_capacity_wh,
-            time_step,
+            timestep,
             battery_id=k,
         )
         if result is None:
@@ -2137,8 +2137,8 @@ def _apply_df_freq_horizon(
 ) -> pd.DataFrame:
     """Helper to apply frequency adjustment and prediction horizon slicing."""
     # Handle Frequency
-    if retrieve_hass_conf.get("optimization_time_step"):
-        step = retrieve_hass_conf["optimization_time_step"]
+    if retrieve_hass_conf.get("optimization_timestep"):
+        step = retrieve_hass_conf["optimization_timestep"]
         if not isinstance(step, pd._libs.tslibs.timedeltas.Timedelta):
             step = pd.to_timedelta(step, "minute")
         df = df[~df.index.duplicated(keep="last")]
@@ -2428,7 +2428,7 @@ async def set_input_data_dict(
     rh = RetrieveHass(
         retrieve_hass_conf["hass_url"],
         retrieve_hass_conf["long_lived_token"],
-        retrieve_hass_conf["optimization_time_step"],
+        retrieve_hass_conf["optimization_timestep"],
         retrieve_hass_conf["time_zone"],
         params,
         emhass_conf,
@@ -3672,7 +3672,7 @@ async def export_influxdb_to_csv(
         rh = RetrieveHass(
             retrieve_hass_conf["hass_url"],
             retrieve_hass_conf["long_lived_token"],
-            retrieve_hass_conf["optimization_time_step"],
+            retrieve_hass_conf["optimization_timestep"],
             retrieve_hass_conf["time_zone"],
             params,
             emhass_conf,
@@ -3826,8 +3826,8 @@ def _load_opt_res_latest(
         input_data_dict["retrieve_hass_conf"]["time_zone"]
     )
     # Infer the index frequency from the saved data itself rather than asserting
-    # the current request's optimization_time_step onto it (#976): the CSV may
-    # have been written by a run with a different runtime optimization_time_step,
+    # the current request's optimization_timestep onto it (#976): the CSV may
+    # have been written by a run with a different runtime optimization_timestep,
     # and pandas raises on the mismatch. The publish path only needs the
     # timestamps for nearest-index matching. Frames with fewer than 2 rows carry
     # no inferable spacing, so leave their freq unset.
@@ -4376,7 +4376,7 @@ async def continual_publish(
     """
     logger.info("Continual publish thread service started")
     freq = input_data_dict["retrieve_hass_conf"].get(
-        "optimization_time_step", pd.to_timedelta(1, "minutes")
+        "optimization_timestep", pd.to_timedelta(1, "minutes")
     )
     while True:
         # Sleep for x seconds (using current time as a reference for time left)
@@ -4432,8 +4432,8 @@ async def _publish_and_update_freq(input_data_dict, entity_path, logger, current
             content = await file.read()
             metadata = orjson.loads(content)
             # Check if freq should be shorter
-            if metadata.get("lowest_time_step") is not None:
-                return pd.to_timedelta(metadata["lowest_time_step"], "minutes")
+            if metadata.get("lowest_timestep") is not None:
+                return pd.to_timedelta(metadata["lowest_timestep"], "minutes")
     return current_freq
 
 
@@ -4482,7 +4482,7 @@ async def publish_json(
         input_data_dict["retrieve_hass_conf"]["time_zone"]
     )
     entity_data.index.freq = pd.to_timedelta(
-        int(metadata[entity_id]["optimization_time_step"]), "minutes"
+        int(metadata[entity_id]["optimization_timestep"]), "minutes"
     )
     # Calculate the current state value
     if input_data_dict["retrieve_hass_conf"]["method_ts_round"] == "nearest":
