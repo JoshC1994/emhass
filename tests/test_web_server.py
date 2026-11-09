@@ -123,11 +123,14 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/get-json", data=b": - invalid")
         self.assertEqual(response.status_code, 500)
 
+    @patch("emhass.web_server.replace_file", new_callable=AsyncMock)
     @patch("emhass.web_server.aiofiles.open")
     @patch("os.path.exists")
     @patch("emhass.web_server.build_params")
     @patch("emhass.web_server.param_to_config")
-    async def test_parameter_set(self, mock_p2c, mock_build_params, mock_exists, mock_file):
+    async def test_parameter_set(
+        self, mock_p2c, mock_build_params, mock_exists, mock_file, mock_replace
+    ):
         mock_exists.return_value = True
         f_defaults = AsyncMock()
         f_defaults.read.return_value = orjson.dumps({"default": 1})
@@ -137,7 +140,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_p2c.return_value = {"new": "config"}
         response = await self.client.post("/set-config", json={"some": "data"})
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(f_write.write.called)
+        self.assertEqual(mock_replace.call_count, 2)  # config.json, then params.pkl
 
     @patch("emhass.web_server.aiofiles.open")
     @patch("os.path.exists")
@@ -166,12 +169,13 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_build_params.assert_not_called()
         mock_p2c.assert_not_called()
 
+    @patch("emhass.web_server.replace_file", new_callable=AsyncMock)
     @patch("emhass.web_server.aiofiles.open")
     @patch("os.path.exists")
     @patch("emhass.web_server.build_params")
     @patch("emhass.web_server.param_to_config")
     async def test_parameter_set_accepts_an_empty_heat_topology(
-        self, mock_p2c, mock_build_params, mock_exists, mock_file
+        self, mock_p2c, mock_build_params, mock_exists, mock_file, mock_replace
     ):
         """An empty text box means "no topology": null, "", "null" and {} all
         save, so the stricter type check does not lock out zero-config users."""
@@ -187,12 +191,13 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 response = await self.client.post("/set-config", json={"heat_topology": empty})
                 self.assertEqual(response.status_code, 200)
 
+    @patch("emhass.web_server.replace_file", new_callable=AsyncMock)
     @patch("emhass.web_server.aiofiles.open")
     @patch("os.path.exists")
     @patch("emhass.web_server.build_params")
     @patch("emhass.web_server.param_to_config")
     async def test_parameter_set_accepts_valid_heat_topology(
-        self, mock_p2c, mock_build_params, mock_exists, mock_file
+        self, mock_p2c, mock_build_params, mock_exists, mock_file, mock_replace
     ):
         """A valid heat_topology compiles cleanly and the save proceeds."""
         mock_exists.return_value = True
@@ -217,7 +222,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         }
         response = await self.client.post("/set-config", json={"heat_topology": good_topology})
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(f_write.write.called)
+        self.assertEqual(mock_replace.call_count, 2)  # config.json, then params.pkl
 
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.perfect_forecast_optim")
@@ -234,6 +239,52 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/action/perfect-optim", json={})
         self.assertEqual(response.status_code, 200)
         mock_optim.assert_called_once()
+
+    @patch("emhass.web_server.grab_log", new_callable=AsyncMock)
+    @patch("emhass.web_server.set_input_data_dict")
+    @patch("emhass.web_server.perfect_forecast_optim", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime")
+    async def test_action_optim_inverter_refusal_is_400(
+        self, mock_load, mock_optim, mock_set_input, mock_grab
+    ):
+        """An optimizer refusal above one inverter (#1150) is a bad request, not a 500."""
+        from emhass.utils import InverterConfigError
+
+        mock_load.return_value = ({"optim_conf": {}}, "profit", "{}")
+        mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
+        mock_optim.side_effect = InverterConfigError(
+            "number_of_inverters=2: perfect-optim has no PV history per inverter"
+        )
+        mock_grab.return_value = ["ERROR perfect-optim has no PV history per inverter"]
+        response = await self.client.post("/action/perfect-optim", json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no PV history per inverter", await response.get_data(as_text=True))
+        # counterfactual: any other error is still not turned into a 400
+        mock_optim.side_effect = RuntimeError("solver crashed")
+        response = await self.client.post("/action/perfect-optim", json={})
+        self.assertEqual(response.status_code, 500)
+
+    @patch("emhass.web_server.set_input_data_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server.perfect_forecast_optim", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params", new_callable=AsyncMock)
+    async def test_dry_run_inverter_refusal_is_400(self, mock_params, mock_optim, mock_set_input):
+        """A dry run answers an optimizer refusal above one inverter (#1150) with a 400."""
+        from emhass.utils import InverterConfigError
+
+        mock_params.return_value = ("{}", "profit")
+        mock_set_input.return_value = {"retrieve_hass_conf": {}}
+        mock_optim.side_effect = InverterConfigError(
+            "number_of_inverters=2: perfect-optim has no PV history per inverter"
+        )
+        response = await self.client.post("/api/v1/dry-run/perfect-optim", json={})
+        self.assertEqual(response.status_code, 400)
+        body = await response.get_json()
+        self.assertEqual(body["status"], "not-run")
+        self.assertIsNone(body["plan"])
+        # counterfactual: any other error is still a 500
+        mock_optim.side_effect = RuntimeError("solver crashed")
+        response = await self.client.post("/api/v1/dry-run/perfect-optim", json={})
+        self.assertEqual(response.status_code, 500)
 
     @patch("emhass.web_server.export_influxdb_to_csv")
     @patch("emhass.web_server._load_params_and_runtime")
@@ -254,17 +305,62 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         # App returns 400 for failures in this specific action
         self.assertEqual(response.status_code, 400)
 
-    @patch("emhass.web_server.grab_log", new_callable=AsyncMock)
     @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
     @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
-    async def test_action_weather_cache_soc_fraction_is_400(self, mock_load, mock_cache, mock_grab):
+    async def test_action_weather_cache_400_never_returns_other_requests_log(
+        self, mock_load, mock_cache
+    ):
+        """Both 400 paths answer with a request-specific message, not the shared log's tail.
+
+        The action log is shared and holds every request's runtime parameters, which can include
+        API keys. The log below has another request's (fake) credentials after this request's
+        marker, as happens when two requests overlap.
+        """
         from emhass.utils import SocFractionError
 
         mock_load.return_value = ({}, "profit", "{}")
-        mock_cache.side_effect = SocFractionError("soc_init=65 is above 1")
-        mock_grab.return_value = ["ERROR soc_init=65 is above 1"]
+        interleaved_log = (
+            "INFO - emhass.web_server -  >> Performing weather forecast, try to caching result\n"
+            "INFO - emhass.web_server - Passed runtime parameters: "
+            "{'solcast_api_key': 'FAKE-KEY-123', 'long_lived_token': 'FAKE-TOKEN-456'}\n"
+            "ERROR - emhass.web_server - another request failed\n"
+        )
+        for label, effect, expected in (
+            ("returned False", False, "Weather forecast failed"),
+            ("SOC fraction", SocFractionError("soc_init=65 is above 1"), "soc_init=65 is above 1"),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                mock_cache.side_effect = effect if isinstance(effect, Exception) else None
+                mock_cache.return_value = effect
+                self.mock_conf["data_path"] = pathlib.Path(tmp)
+                (pathlib.Path(tmp) / web_server.action_log_str).write_text(interleaved_log)
+                response = await self.client.post("/action/weather-forecast-cache", json={})
+                body = await response.get_data(as_text=True)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(expected, body)
+                for secret in ("FAKE-KEY-123", "FAKE-TOKEN-456", "another request failed"):
+                    self.assertNotIn(secret, body)
+
+    @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_weather_cache_transport_failure_is_not_hidden(
+        self, mock_load, mock_cache
+    ):
+        """A raised provider or network failure is a server error (500), not a 200 or a 400 result."""
+        import aiohttp
+
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_cache.side_effect = aiohttp.ClientConnectionError("provider unreachable")
         response = await self.client.post("/action/weather-forecast-cache", json={})
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 500)
+
+    @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_weather_cache_success_is_200(self, mock_load, mock_cache):
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_cache.return_value = True
+        response = await self.client.post("/action/weather-forecast-cache", json={})
+        self.assertEqual(response.status_code, 200)
 
     @patch("emhass.web_server.grab_log", new_callable=AsyncMock)
     @patch("emhass.web_server.export_influxdb_to_csv", new_callable=AsyncMock)
@@ -277,6 +373,31 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_grab.return_value = ["ERROR soc_init=65 is above 1"]
         response = await self.client.post("/action/export-influxdb-to-csv", json={})
         self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.grab_log", new_callable=AsyncMock)
+    @patch("emhass.web_server.export_influxdb_to_csv", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_export_csv_inverter_config_error_is_400(
+        self, mock_load, mock_export, mock_grab
+    ):
+        from emhass.utils import InverterConfigError
+
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_export.side_effect = InverterConfigError("number_of_inverters=2 is not supported")
+        mock_grab.return_value = ["ERROR number_of_inverters=2 is not supported"]
+        response = await self.client.post("/action/export-influxdb-to-csv", json={})
+        self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_weather_cache_inverter_config_error_is_400(self, mock_load, mock_cache):
+        from emhass.utils import InverterConfigError
+
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_cache.side_effect = InverterConfigError("inverter_ac_output_max must be a list")
+        response = await self.client.post("/action/weather-forecast-cache", json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("inverter_ac_output_max", await response.get_data(as_text=True))
 
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.forecast_model_fit")
@@ -684,20 +805,18 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, mock_data)
 
     @patch("os.path.exists")
-    @patch("emhass.web_server.aiofiles.open")
+    @patch("emhass.web_server.replace_file", new_callable=AsyncMock)
     @patch("emhass.web_server.build_params", new_callable=AsyncMock)
-    async def test_build_and_save_params(self, mock_build_params, mock_aio_open, mock_os_exists):
+    async def test_build_and_save_params(self, mock_build_params, mock_replace, mock_os_exists):
         config = {"some": "config"}
         c_path = pathlib.Path("/config.json")
         # Test 1: Success Path
         mock_build_params.return_value = {"optim_conf": {}}
         mock_os_exists.return_value = True
-        mock_file = AsyncMock()
-        mock_aio_open.return_value.__aenter__.return_value = mock_file
         params = await web_server._build_and_save_params(config, "cost", "INFO", c_path)
         self.assertEqual(params["optim_conf"]["costfun"], "cost")
         self.assertEqual(params["optim_conf"]["logging_level"], "INFO")
-        mock_file.write.assert_called_once()
+        mock_replace.assert_called_once()
         # Test 2: build_params fails
         mock_build_params.return_value = False
         with self.assertRaises(Exception) as context:

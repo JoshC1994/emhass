@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import pathlib
 import re
 import tempfile
@@ -1584,6 +1585,11 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_build_secrets(self):
+        # build_secrets prefers EMHASS_URL, SUPERVISOR_TOKEN and TIME_ZONE from the environment over
+        # the files under test; a developer's own values must not change the expected defaults.
+        environ = self.enterContext(patch.dict(os.environ))
+        for name in ("EMHASS_URL", "SUPERVISOR_TOKEN", "TIME_ZONE"):
+            environ.pop(name, None)
         # Test the build_secrets defaults from get_test_params()
         params = await TestUtils.get_test_params()
         expected_keys = [
@@ -2025,6 +2031,27 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params_out["passed_data"]["soc_init"], 1.0)
         self.assertEqual(params_out["passed_data"]["soc_final"], 1.0)
         self.assertEqual(plant_conf_out["battery_maximum_state_of_charge"], 1.0)
+
+    async def test_treat_runtimeparams_dayahead_passes_per_battery_soc_target(self):
+        """A runtimeparams blob shared with naive-mpc-optim (per-battery soc_target
+        lists) must not crash dayahead-optim."""
+        params_out, _, _, _ = await self._treat_soc_runtime(
+            {"soc_target": [None, 0.8], "soc_target_timestep": [None, 5]},
+            "dayahead-optim",
+        )
+        params_out = orjson.loads(params_out)
+        self.assertEqual(params_out["passed_data"]["soc_target"], [None, 0.8])
+        self.assertEqual(params_out["passed_data"]["soc_target_timestep"], [None, 5])
+
+    async def test_treat_runtimeparams_passes_def_availability(self):
+        """def_availability reaches naive-mpc-optim unchanged; validation happens in
+        Optimization.perform_optimization, as for battery_availability."""
+        mask = [None, [1, 1, 0, 0, 0.5]]
+        params_out, _, _, _ = await self._treat_soc_runtime(
+            {"prediction_horizon": 10, "def_availability": mask}
+        )
+        params_out = orjson.loads(params_out)
+        self.assertEqual(params_out["passed_data"]["def_availability"], mask)
 
     async def test_treat_runtimeparams_rejects_configured_soc_without_runtime(self):
         """A percentage saved in the plant config fails even when the request adds nothing."""
@@ -2729,6 +2756,14 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                 }
             )
         self.assertEqual(out["shared_thermal_tanks"][0]["start_temperature"], 50.0)
+        with self.assertLogs(logger, level="WARNING"):
+            out = await self._run_treat_runtimeparams_dict(
+                {
+                    "shared_thermal_tanks": [self._manual_tank(start_temperature=50.0)],
+                    "shared_tank_prior_heat": {"dhw": [huge]},
+                }
+            )
+        self.assertNotIn("prior_heat", out["shared_thermal_tanks"][0])
 
     async def test_heat_topology_extend_pads_runtime_state_arrays(self):
         """Runtime state given for the user's loads gets the defaults for the
@@ -2884,6 +2919,106 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(out.get("shared_thermal_tanks"))
                 self.assertTrue(any("load_ids" in m for m in log_cm.output))
+
+    async def test_treat_runtimeparams_shared_tank_prior_heat_patch(self):
+        """shared_tank_prior_heat feeds the lag model's initial condition (thermal
+        kWh already in flight from previous MPC runs) by tank id."""
+        out = await self._run_treat_runtimeparams(
+            {
+                "shared_thermal_tanks": [self._manual_tank(start_temperature=50.0)],
+                "shared_tank_prior_heat": {"dhw": [0.4, 1.2]},
+            }
+        )
+        self.assertEqual(out["shared_thermal_tanks"][0]["prior_heat"], [0.4, 1.2])
+
+    async def test_treat_runtimeparams_shared_tank_prior_heat_rejects_bad_feeds(self):
+        """A stale or malformed feed must degrade to the previous cold-start
+        behaviour (no prior_heat) with a warning, never a wrong-but-plausible plan."""
+        for payload, needle in (
+            ({"no_such_tank": [1.0]}, "no_such_tank"),
+            ({"dhw": "1.0,2.0"}, "must be a list"),
+            ({"dhw": [1.0, "warm"]}, "not all numeric"),
+            ({"dhw": [-1.0, 2.0]}, ">= 0"),
+            # A boolean is not heat (float(True) would be 1.0).
+            ({"dhw": [True, 1.0]}, "not all numeric"),
+        ):
+            with self.assertLogs(logger, level="WARNING") as log_cm:
+                out = await self._run_treat_runtimeparams(
+                    {
+                        "shared_thermal_tanks": [self._manual_tank(start_temperature=50.0)],
+                        "shared_tank_prior_heat": payload,
+                    }
+                )
+            self.assertNotIn("prior_heat", out["shared_thermal_tanks"][0])
+            self.assertTrue(any(needle in m for m in log_cm.output), f"expected {needle!r} warning")
+
+    async def test_treat_runtimeparams_shared_tank_prior_heat_matches_ids_as_text(self):
+        """JSON object keys are always strings, so a tank with a numeric id is
+        matched by its text form, as shared_tank_start_temperatures does."""
+        tank = self._manual_tank(start_temperature=50.0)
+        tank["id"] = 0
+        out = await self._run_treat_runtimeparams(
+            {
+                "shared_thermal_tanks": [tank],
+                "shared_tank_prior_heat": {"0": [0.4, 1.2]},
+            }
+        )
+        self.assertEqual(out["shared_thermal_tanks"][0]["prior_heat"], [0.4, 1.2])
+
+    async def test_treat_runtimeparams_bad_prior_heat_starts_the_tank_cold(self):
+        """A malformed runtime value replaces a configured prior_heat with none, so
+        the tank starts cold for the run instead of using stale heat."""
+        tank = self._manual_tank(start_temperature=50.0)
+        tank["prior_heat"] = [2.0, 2.0]
+        with self.assertLogs(logger, level="WARNING") as log_cm:
+            out = await self._run_treat_runtimeparams(
+                {"shared_thermal_tanks": [tank], "shared_tank_prior_heat": {"dhw": "warm"}}
+            )
+        self.assertNotIn("prior_heat", out["shared_thermal_tanks"][0])
+        self.assertTrue(any("starts cold" in m for m in log_cm.output), log_cm.output)
+
+    async def test_treat_runtimeparams_prior_heat_ambiguous_ids_are_ignored(self):
+        """Storage ids 0 and "0" pass the topology compiler (it compares raw ids)
+        but read the same as a JSON key: the value is applied to neither."""
+        storage = {"thermal_mass": 8.0, "thermal_inertia": 1.0, "start_temperature": 20.0}
+        topo = {
+            "sources": [
+                {"id": "hp", "type": "heatpump", "nominal_power": 3000, "supply_temperature": 45}
+            ],
+            "storage": [{"id": 0, **storage}, {"id": "0", **storage}],
+            "flows": [{"from": "hp", "to": 0}, {"from": "hp", "to": "0"}],
+        }
+        with self.assertLogs(logger, level="WARNING") as log_cm:
+            out = await self._run_treat_runtimeparams(
+                {"heat_topology": topo, "shared_tank_prior_heat": {"0": [1.0]}}
+            )
+        tanks = out["shared_thermal_tanks"]
+        self.assertEqual(len(tanks), 2)
+        self.assertTrue(all("prior_heat" not in t for t in tanks))
+        self.assertTrue(any("read the same" in m for m in log_cm.output), log_cm.output)
+
+    async def test_compile_heat_topology_passes_prior_heat_through(self):
+        """prior_heat is a per-step list, so the compiler must pass it through
+        unconverted (the sibling zone keys are coerced to scalar floats)."""
+        topo = {
+            "sources": [
+                {"id": "hp", "type": "heatpump", "nominal_power": 3000, "supply_temperature": 45}
+            ],
+            "storage": [
+                {
+                    "id": "zone",
+                    "thermal_mass": 8.0,
+                    "thermal_inertia": 1.0,
+                    "prior_heat": [0.5, 1.5],
+                    "start_temperature": 20.0,
+                }
+            ],
+            "flows": [{"from": "hp", "to": "zone"}],
+        }
+        compiled = utils.compile_heat_topology(topo)
+        tank = compiled["shared_thermal_tanks"][0]
+        self.assertEqual(tank["prior_heat"], [0.5, 1.5])
+        self.assertEqual(tank["thermal_inertia"], 1.0)
 
     async def test_treat_runtimeparams_shared_tank_start_temperature_patches_compiled(self):
         """The override applies AFTER the heat_topology compile, so a tank that
@@ -3870,6 +4005,44 @@ class TestHeatingDemand(unittest.TestCase):
             np.sum(demand_with_solar[solar_irradiance > 0.0]),
             np.sum(demand_no_solar[solar_irradiance > 0.0]),
             "Solar irradiance should reduce total heating demand during sunny periods",
+        )
+
+    def test_calculate_thermal_balance_physics_excess_gains_can_be_negative(self):
+        """Excess solar/internal gains are retained in signed balance but not demand."""
+        indoor_temp = 21.0
+        outdoor_temps = np.array([5.0, 5.0, 5.0, 5.0])
+        solar_irradiance = np.array([0.0, 800.0, 0.0, 800.0])
+        load_forecast = np.array([0.0, 0.0, 10000.0, 10000.0])
+
+        kwargs = {
+            "u_value": 0.35,
+            "envelope_area": 380.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 240.0,
+            "indoor_target_temperature": indoor_temp,
+            "outdoor_temperature_forecast": outdoor_temps,
+            "optimization_time_step": 60,
+            "solar_irradiance_forecast": solar_irradiance,
+            "window_area": 28.0,
+            "shgc": 0.6,
+            "internal_gains_forecast": load_forecast,
+            "internal_gains_factor": 0.8,
+        }
+
+        balance = utils.calculate_thermal_balance_physics(**kwargs)
+        demand = utils.calculate_heating_demand_physics(**kwargs)
+
+        # 2.64256 kW envelope/ventilation loss; 13.44 kW solar and 8 kW internal gains.
+        np.testing.assert_allclose(
+            balance,
+            [2.64256, -10.79744, -5.35744, -18.79744],
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            demand,
+            [2.64256, 0.0, 0.0, 0.0],
+            atol=1e-8,
+            err_msg="Reported heating demand must stay clipped at zero",
         )
 
     def test_calculate_heating_demand_physics_scaling_with_timestep(self):
@@ -6566,6 +6739,15 @@ class TestRuntimeBanner(unittest.TestCase):
                     log_runtime_banner(test_logger)  # must not raise
         self.assertEqual(len(cm.output), 1)
         self.assertIn("runtime info unavailable", cm.records[0].getMessage())
+
+
+class TestValidateNumBatteriesOverflow(unittest.TestCase):
+    def test_an_int_too_large_for_a_float_is_a_value_error(self):
+        # A count far too large for a float must still raise the documented
+        # ValueError (callers catch ValueError), and name the limit.
+        with self.assertRaises(ValueError) as ctx:
+            utils.validate_num_batteries({"number_of_batteries": 10**400})
+        self.assertIn("number_of_batteries must be at most 100", str(ctx.exception))
 
 
 if __name__ == "__main__":

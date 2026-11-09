@@ -66,7 +66,7 @@ Below you can find a list of the variables resulting from EMHASS computation, sh
 | unit_prod_price | Forecasted price you receive for selling excess solar energy back to the grid (typically "Currency"/kWh). This helps you understand the potential income from your solar production. | sensor.unit_prod_price |
 | cost_profit | Forecasted profit or loss from your energy usage for the forecast period. This is calculated as unit_load_cost * P_Load - unit_prod_price * P_grid_pos. A positive value indicates a profit, while a negative value indicates a loss. | sensor.total_cost_profit_value |
 | cost_fun_cost | Forecasted cost associated with deferring loads to maximize solar self-consumption. This helps you evaluate the trade-off between managing the load and not managing and potential cost savings. | sensor.total_cost_fun_value |
-| optim_status | This contains the status of the latest execution and is the same you can see in the Log following an optimization job. `Optimal`: the plan is the solver's optimum. `Optimal_Inaccurate`: a feasible plan the solver could not prove optimal (for example a CPLEX time limit; HiGHS, the default, and Gurobi report a time-out as a failed solve instead); the plan is published. `Optimal (Relaxed)`: the full problem could not be solved, so EMHASS solved a relaxed version without the on/off (binary) constraints; the plan is published but may, for example, run a semi-continuous load below its nominal power. `Infeasible` or another status: no usable plan. `/api/v1/last-run` reports `Optimal` and `Optimal_Inaccurate` as `ok`, and `/api/v1/plan` serves the latest of those plans; a failed run does not replace it. | sensor.optim_status |
+| optim_status | This contains the status of the latest execution and is the same you can see in the Log following an optimization job. `Optimal`: the plan is the solver's optimum. `Optimal_Inaccurate`: a feasible plan the solver could not prove optimal (for example a CPLEX time limit; the default HiGHS solver does not return this status, and a Gurobi time limit with a feasible plan is reported as `Optimal (Incumbent)`); the plan is published. `Optimal (Incumbent)`: the solve hit `lp_solver_timeout` after finding a feasible plan, and that plan is used; it satisfies every constraint but may not be optimal. `Optimal (Relaxed)`: the full problem could not be solved, or timed out before any feasible plan was found, so EMHASS solved it again without the semi-continuous and single-constant on/off constraints (mutual-exclusion groups are kept); the plan is published but may, for example, run a semi-continuous load below its nominal power. `Infeasible` or another status: no usable plan. `/api/v1/last-run` reports every status with a published plan (`Optimal`, `Optimal_Inaccurate`, `Optimal (Incumbent)`, `Optimal (Relaxed)`) as `ok`, and `/api/v1/plan` serves the latest of those plans; a failed run does not replace it. | sensor.optim_status |
 
 ## Deferrable load command states *(optional)*
 
@@ -125,7 +125,7 @@ For users that wish to run multiple different optimizations, you can set the run
 # RUN dayahead, with optimization_time_step=30 (default), prefix=dh_ 
 curl -i -H 'Content-Type:application/json' -X POST -d '{"publish_prefix":"dh_"}' http://localhost:5000/action/dayahead-optim
 # RUN MPC, with optimization_time_step=5, prefix=mpc_
-curl -i -H 'Content-Type:application/json' -X POST -d '{'optimization_time_step':5,"publish_prefix":"mpc_"}' http://localhost:5000/action/naive-mpc-optim
+curl -i -H 'Content-Type:application/json' -X POST -d '{"optimization_time_step":5,"publish_prefix":"mpc_"}' http://localhost:5000/action/naive-mpc-optim
 ```
 This will tell continual_publish to loop every 5 minutes based on the optimization_time_step passed in MPC. All entities from the output of dayahead "dh_" and MPC "mpc_" will be published every 5 minutes.
 
@@ -144,7 +144,7 @@ You can choose to save one optimization for continual_publish and bypass another
 curl -i -H 'Content-Type:application/json' -X POST -d '{"publish_prefix":"dh_"}' http://localhost:5000/action/dayahead-optim
 
 # RUN MPC, with optimization_time_step=5, prefix=mpc_, Manually publish, excluded from continual_publish loop
-curl -i -H 'Content-Type:application/json' -X POST -d '{'continual_publish':false,'optimization_time_step':5,"publish_prefix":"mpc_"}' http://localhost:5000/action/naive-mpc-optim
+curl -i -H 'Content-Type:application/json' -X POST -d '{"continual_publish":false,"optimization_time_step":5,"publish_prefix":"mpc_"}' http://localhost:5000/action/naive-mpc-optim
 # Publish MPC output
 curl -i -H 'Content-Type:application/json' -X POST -d {} http://localhost:5000/action/publish-data
 ```
@@ -163,7 +163,7 @@ POST action :
 # RUN dayahead, with optimization_time_step=30 (default), prefix=dh_, save entity
 curl -i -H 'Content-Type:application/json' -X POST -d '{"entity_save": true, "publish_prefix":"dh_"}' http://localhost:5000/action/dayahead-optim
 # RUN MPC, with optimization_time_step=5, prefix=mpc_, save entity
-curl -i -H 'Content-Type:application/json' -X POST -d '{"entity_save": true", 'optimization_time_step':5,"publish_prefix":"mpc_"}' http://localhost:5000/action/naive-mpc-optim
+curl -i -H 'Content-Type:application/json' -X POST -d '{"entity_save":true,"optimization_time_step":5,"publish_prefix":"mpc_"}' http://localhost:5000/action/naive-mpc-optim
 ```
 You can then reference these .json saved entities via their `publish_prefix`. Include the same `publish_prefix` in the `publish_data` action:
 ```bash

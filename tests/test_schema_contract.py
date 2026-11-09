@@ -67,6 +67,17 @@ _KNOWN_TYPE_MISMATCHES = frozenset(
         # battery_* block above).
         "capacity_cost_per_kw",
         "capacity_charge_interval_timesteps",
+        # #1150: declared array.* because they take a list of one entry per inverter
+        # (the efficiencies, stress cost and compute_curtailment also take a scalar
+        # that is broadcast), but their defaults stay bare scalars on purpose - a
+        # scalar is the one-inverter value and keeps existing configs byte-identical
+        # (number_of_inverters defaults to 1).
+        "inverter_ac_output_max",
+        "inverter_ac_input_max",
+        "inverter_efficiency_dc_ac",
+        "inverter_efficiency_ac_dc",
+        "inverter_stress_cost",
+        "compute_curtailment",
     }
 )
 
@@ -567,6 +578,7 @@ def test_save_configuration_object_type_null_representations(js_src):
         "  return { status: 200, json: async function() { return {}; } };\n"
         "};\n"
         "function showChangeStatus() {}\n"
+        "var REQUEST_TIMEOUT_MS = 30000;\n"
         "function errorAlert(msg) { throw new Error('errorAlert: ' + msg); }\n\n"
         + save_fn_src
         + "\n\n"
@@ -877,6 +889,7 @@ def _run_array_control_probe(js_src, section, params, *, click=None, typed=None)
         _extract_function_src(js_src, name)
         for name in (
             "checkConfigParam",
+            "escapeHtml",
             "buildParamElement",
             "plusElements",
             "minusElements",

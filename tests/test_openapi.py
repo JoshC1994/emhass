@@ -103,7 +103,7 @@ class TestConfigComponent(unittest.TestCase):
         }
 
     def test_flattens_all_sections_into_properties(self):
-        comp = gen.build_config_component(self._defs())
+        comp = gen.build_config_component(self._defs(), {})
         self.assertEqual(comp["type"], "object")
         self.assertIn("costfun", comp["properties"])
         self.assertIn("battery_power", comp["properties"])
@@ -112,7 +112,7 @@ class TestConfigComponent(unittest.TestCase):
         defs = self._defs()
         defs["SectionB"]["costfun"] = {"input": "int", "default_value": 1}
         with self.assertRaises(SystemExit):
-            gen.build_config_component(defs)
+            gen.build_config_component(defs, {})
 
 
 class TestRouteGuard(unittest.TestCase):
@@ -184,6 +184,35 @@ class TestBuildSpec(unittest.TestCase):
         self.assertIn("plan_output_schema.md", action["externalDocs"]["url"])
         self.assertNotIn("externalDocs", action["responses"]["200"])
 
+    def test_action_documents_live_optimization_rejections(self):
+        responses = gen.build_spec()["paths"]["/action/{action_name}"]["post"]["responses"]
+        for code, phrase in (("429", "not run"), ("503", "failed closed")):
+            self.assertIn(code, responses)
+            description = responses[code]["description"]
+            for action in ("naive-mpc-optim", "dayahead-optim", "perfect-optim"):
+                self.assertIn(action, description)
+            self.assertIn(phrase, description)
+            header = responses[code]["headers"]["Retry-After"]
+            self.assertEqual(header["schema"], {"type": "integer"})
+        self.assertIn("not queued", responses["429"]["description"])
+        for code in ("200", "400"):
+            self.assertIn(code, responses)
+
+    def test_committed_artifact_documents_live_optimization_rejections(self):
+        committed = json.loads(
+            (REPO_ROOT / "src" / "emhass" / "static" / "openapi.json").read_text(encoding="utf-8")
+        )
+        responses = committed["paths"]["/action/{action_name}"]["post"]["responses"]
+        self.assertEqual(
+            {c: responses[c] for c in ("429", "503")},
+            {
+                c: gen.build_spec()["paths"]["/action/{action_name}"]["post"]["responses"][c]
+                for c in ("429", "503")
+            },
+        )
+        self.assertIn("Retry-After", responses["429"]["headers"])
+        self.assertIn("Retry-After", responses["503"]["headers"])
+
     def test_action_request_is_open_object(self):
         spec = gen.build_spec()
         body = spec["paths"]["/action/{action_name}"]["post"]["requestBody"]
@@ -240,7 +269,44 @@ class TestOpenapiArtifact(unittest.TestCase):
             "battery_soc_deficit_threshold",
             "battery_soc_surplus_threshold",
         ):
-            self.assertEqual(properties[name]["items"]["maximum"], 1)
+            # A scalar default means /get-config returns a scalar at one battery, so the
+            # property is "scalar or array"; the bound sits on both branches.
+            scalar, array = properties[name]["anyOf"]
+            self.assertEqual(scalar["maximum"], 1)
+            self.assertEqual(array["items"]["maximum"], 1)
+
+    def test_array_params_with_a_scalar_default_accept_a_scalar_or_an_array(self):
+        properties = gen.build_spec()["components"]["schemas"]["Config"]["properties"]
+        for name, element_type in (
+            ("inverter_efficiency_dc_ac", "number"),
+            ("inverter_ac_output_max", "integer"),
+            ("compute_curtailment", "boolean"),
+            ("battery_charge_power_max", "integer"),
+        ):
+            with self.subTest(name=name):
+                prop = properties[name]
+                self.assertNotIn("type", prop)
+                scalar, array = prop["anyOf"]
+                self.assertEqual(scalar["type"], element_type)
+                self.assertEqual(array["type"], "array")
+                self.assertEqual(array["items"]["type"], element_type)
+                self.assertIn("default", array["items"])  # the element default stays where it was
+                self.assertIn("title", prop)
+                self.assertIn("description", prop)
+        self.assertEqual(properties["battery_charge_power_max"]["x-unit"], "W")
+        self.assertNotIn("x-unit", properties["battery_charge_power_max"]["anyOf"][0])
+
+    def test_array_params_with_a_null_or_list_default_stay_plain_arrays(self):
+        properties = gen.build_spec()["components"]["schemas"]["Config"]["properties"]
+        for name in (
+            "battery_inverter_index",  # null default
+            "pv_plant_inverter_index",
+            "inverter_power_curve_dc_ac",  # list default
+            "nominal_power_of_deferrable_loads",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(properties[name]["type"], "array")
+                self.assertNotIn("anyOf", properties[name])
 
 
 if __name__ == "__main__":
